@@ -10,6 +10,7 @@ use figcraft_engine::Session;
 use serde_json::json;
 
 use crate::layers_drag_tests::Ui;
+use crate::{FigApp, NoServices};
 
 fn id(v: serde_json::Value) -> NodeId {
     NodeId(v["id"].as_u64().unwrap())
@@ -208,8 +209,9 @@ fn pages_drag_to_reorder_and_dividers_open_nothing() {
     s.execute("page.select", &json!({"id": p1})).unwrap();
     let mut u = Ui::new(s);
     let (r1, r3) = (page_row(&mut u, p1, p2), page_row(&mut u, p3, p2));
-    u.drag_to(r3, r1 - egui::vec2(0.0, 10.0));
-    u.button(r1 - egui::vec2(0.0, 10.0), false);
+    // Keep the release point inside the actual scroll viewport; drops above it are ignored.
+    u.drag_to(r3, r1 - egui::vec2(0.0, 4.0));
+    u.button(r1 - egui::vec2(0.0, 4.0), false);
     assert_eq!(u.app.session.doc().unwrap().pages, [p3, p1, p2], "a page dragged up the list moves there");
     // A divider between two pages: a line that opens nothing.
     let div = id(u.app.session.execute("page.add", &json!({"name": "-"})).unwrap());
@@ -225,4 +227,133 @@ fn pages_drag_to_reorder_and_dividers_open_nothing() {
     click(&mut u, mid, Modifiers::NONE);
     assert_eq!(u.app.session.page().unwrap(), p1, "clicking a divider opens nothing");
     assert!(u.app.ui.last_error.is_none(), "{:?}", u.app.ui.last_error);
+}
+
+#[test]
+fn many_pages_scroll_without_clipping_the_layers_tree() {
+    let mut s = Session::new();
+    let first = s.page().unwrap();
+    let layer = rect(&mut s, "visible-layer", 0.0, None);
+    let last = (1..29).fold(first, |_, i| id(s.execute("page.add", &json!({"name": format!("Page {i:02}")})).unwrap()));
+    s.execute("page.select", &json!({"id": first})).unwrap();
+    s.execute("select.none", &json!({})).unwrap();
+    let mut u = Ui::new(s);
+
+    let layer_row = u.row_at(layer);
+    u.button(layer_row, true);
+    u.button(layer_row, false);
+    assert_eq!(u.app.session.selection(), [layer], "the layers tree remains visible below the bounded pages list");
+    let splitter_id = egui::Id::new("pages_list_splitter");
+    let before = u.ctx.read_response(splitter_id).expect("the page/layers divider is visible").rect.center();
+    u.drag_to(before, before + egui::vec2(0.0, 64.0));
+    u.button(before + egui::vec2(0.0, 64.0), false);
+    let after = u.ctx.read_response(splitter_id).expect("the divider remains visible after dragging").rect.center();
+    assert!(after.y - before.y > 40.0, "dragging the divider increases the pages pane: {before:?} → {after:?}");
+
+    u.app.ui.pages_open = false;
+    u.frame(vec![]);
+    assert!(u.row_at(layer).y > 0.0, "collapsing Pages leaves the layers tree available");
+    u.app.ui.pages_open = true;
+    u.frame(vec![]);
+
+    let wheel = Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -240.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: Modifiers::NONE,
+    };
+    for _ in 0..8 {
+        u.frame(vec![Event::PointerMoved(Pos2::new(150.0, 180.0)), wheel.clone()]);
+    }
+    let mut opened_last = false;
+    for y in (110..450).step_by(4) {
+        let p = Pos2::new(150.0, y as f32);
+        u.button(p, true);
+        u.button(p, false);
+        if u.app.session.page().unwrap() == last {
+            opened_last = true;
+            break;
+        }
+    }
+    assert!(opened_last, "the bottom page remains reachable by scrolling the pages list");
+}
+
+#[test]
+fn dropping_page_drag_over_layers_does_not_reorder_hidden_pages() {
+    let mut s = Session::new();
+    let first = s.page().unwrap();
+    let layer = rect(&mut s, "drop-target", 0.0, None);
+    let second = id(s.execute("page.add", &json!({"name": "Page 2"})).unwrap());
+    for i in 3..30 {
+        s.execute("page.add", &json!({"name": format!("Page {i}")})).unwrap();
+    }
+    s.execute("page.select", &json!({"id": first})).unwrap();
+    s.execute("select.none", &json!({})).unwrap();
+    let mut u = Ui::new(s);
+
+    // Locate the first page's row through the existing page click path, then restore it as current.
+    let _ = page_row(&mut u, second, first);
+    let first_row = page_row(&mut u, first, second);
+    u.app.session.execute("page.select", &json!({"id": first})).unwrap();
+    u.frame(vec![]);
+    let layers_row = u.row_at(layer);
+    let order = u.app.session.doc().unwrap().pages.clone();
+
+    u.drag_to(first_row, layers_row);
+    u.button(layers_row, false);
+
+    assert_eq!(u.app.session.doc().unwrap().pages, order, "a drop outside the visible Pages viewport must not reorder hidden rows");
+}
+
+#[test]
+fn page_layers_splitter_keeps_both_panes_and_clamps_in_small_windows() {
+    let mut s = Session::new();
+    let layer = rect(&mut s, "visible-layer", 0.0, None);
+    let mut u = Ui::new(s);
+    let splitter_id = egui::Id::new("pages_list_splitter");
+    let initial = u.ctx.read_response(splitter_id).expect("the divider is visible").rect.center();
+
+    u.drag_to(initial, initial - egui::vec2(0.0, 1_000.0));
+    u.button(initial - egui::vec2(0.0, 1_000.0), false);
+    let lower = u.ctx.read_response(splitter_id).expect("the divider remains visible at its lower limit").rect.center();
+    assert!((initial.y - lower.y - 144.0).abs() < 1.0, "one-page list retains a 96pt minimum: {initial:?} → {lower:?}");
+    assert!(u.row_at(layer).y > 0.0, "the Layers tree remains visible at the Pages minimum");
+
+    u.drag_to(lower, lower + egui::vec2(0.0, 1_000.0));
+    u.button(lower + egui::vec2(0.0, 1_000.0), false);
+    let upper = u.ctx.read_response(splitter_id).expect("the divider remains visible at its upper limit").rect.center();
+    assert!(upper.y > lower.y + 100.0, "the Pages pane expands while retaining the reserved Layers area");
+
+    u.drag_to(upper, upper + egui::vec2(0.0, 1_000.0));
+    u.button(upper + egui::vec2(0.0, 1_000.0), false);
+    let clamped = u.ctx.read_response(splitter_id).expect("the divider stays visible after an overdrag").rect.center();
+    assert!((clamped.y - upper.y).abs() < 1.0, "overdrag cannot consume the Layers reserve: {upper:?} → {clamped:?}");
+
+    let small_window = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(1_440.0, 300.0));
+    let mut input = egui::RawInput { screen_rect: Some(small_window), ..Default::default() };
+    input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().inner_rect = Some(small_window);
+    let ctx = egui::Context::default();
+    let mut small_session = Session::new();
+    let small_layer = rect(&mut small_session, "small-window-layer", 0.0, None);
+    let mut app = FigApp::new(small_session, Box::new(NoServices));
+    for _ in 0..4 {
+        let mut output = ctx.run_ui(input.clone(), |ui| app.ui(ui));
+        output.textures_delta.clear();
+    }
+    let small = ctx.read_response(splitter_id).expect("a small window keeps the divider").rect;
+    assert!(small.is_positive() && small.max.y <= 300.0, "small-window pane bounds stay nonnegative and within the window: {small:?}");
+    assert!(small.center().y < 220.0, "the Pages viewport shrinks below egui's default 64pt floor: {small:?}");
+    let mut visible_layer = false;
+    for y in (small.max.y as i32..300).step_by(2) {
+        let mut frame_input =
+            egui::RawInput { screen_rect: Some(small_window), events: vec![Event::PointerMoved(Pos2::new(150.0, y as f32))], ..Default::default() };
+        frame_input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().inner_rect = Some(small_window);
+        let mut output = ctx.run_ui(frame_input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+        if app.session.ds().unwrap().hover == Some(small_layer) {
+            visible_layer = true;
+            break;
+        }
+    }
+    assert!(visible_layer, "the Layers tree retains real row space at the scaled 250pt minimum");
 }

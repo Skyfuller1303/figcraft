@@ -14,6 +14,17 @@ use crate::theme::{ACCENT, COMPONENT, Tokens, regular, semibold};
 use crate::{FigApp, LeftTab};
 
 pub const ROW: f32 = 32.0;
+const PAGES_HEIGHT: f32 = 240.0;
+const MIN_PAGES_HEIGHT: f32 = 3.0 * ROW;
+const PAGE_SPLITTER_HEIGHT: f32 = 8.0;
+
+fn pages_height_id() -> Id {
+    Id::new("pages_list_height")
+}
+
+fn pages_height_drag_id() -> Id {
+    Id::new("pages_list_height_drag")
+}
 
 /// A boolean operation's icon.
 pub fn op_icon(op: figcraft_doc::BoolOp) -> Icon {
@@ -202,6 +213,20 @@ fn pages(app: &mut FigApp, ui: &mut Ui) {
     if !app.ui.pages_open {
         return;
     }
+    // Keep three page rows and five layer rows visible; scale both minima together in short windows.
+    let available = ui.available_height().max(0.0);
+    let layers_reserve = 5.0 * ROW + 72.0;
+    let pane_space = (available - PAGE_SPLITTER_HEIGHT).max(0.0);
+    let minimum_pane_space = MIN_PAGES_HEIGHT + layers_reserve;
+    let (min_pages_height, min_layers_height) = if pane_space >= minimum_pane_space {
+        (MIN_PAGES_HEIGHT, layers_reserve)
+    } else {
+        let page_share = MIN_PAGES_HEIGHT / minimum_pane_space;
+        (pane_space * page_share, pane_space * (1.0 - page_share))
+    };
+    let max_pages_height = (pane_space - min_layers_height).max(min_pages_height);
+    let requested: f32 = ui.data_mut(|d| d.get_persisted(pages_height_id())).unwrap_or(PAGES_HEIGHT);
+    let pages_height = requested.clamp(min_pages_height, max_pages_height);
     let Ok(ds) = app.session.ds() else { return };
     let pages: Vec<(NodeId, String, bool)> =
         ds.doc.pages.iter().filter_map(|p| ds.doc.node(*p).map(|n| (*p, n.name.clone(), ds.doc.is_divider(*p)))).collect();
@@ -214,65 +239,108 @@ fn pages(app: &mut FigApp, ui: &mut Ui) {
     let pointer = ui.input(|i| i.pointer.hover_pos());
     let mut move_to: Option<(NodeId, String)> = None;
     // Pages are dragged up and down the list to reorder them.
-    let mut reorder = crate::list_drag::ListDrag::in_order(ui, "pages");
-    for (k, (id, name, divider)) in pages.iter().cloned().enumerate() {
-        let (r, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click_and_drag());
-        reorder.row_by(&resp, k, r, || if divider { tr("Divider").to_string() } else { name.clone() });
-        a11y::list_item(&resp, if divider { tr("Divider") } else { &name }, id == cur);
-        let r = r.shrink2(vec2(8.0, 0.0));
-        a11y::ring_around(ui, r, &resp);
-        let renaming = app.ui.rename_page.as_ref().is_some_and(|(i, _)| *i == id);
-        if divider && !renaming {
-            // A divider is a line between pages: it opens nothing and takes no layers.
-            ui.painter().line_segment([pos2(r.min.x + 10.0, r.center().y), pos2(r.max.x - 10.0, r.center().y)], Stroke::new(1.0, t.border));
-        } else if resp.hovered() || id == cur {
-            ui.painter().rect_filled(r, CornerRadius::same(5), t.hover);
-        }
-        if dragging.is_some()
+    let reordered = egui::ScrollArea::vertical()
+        .id_salt("page_list")
+        .auto_shrink(false)
+        .min_scrolled_height(min_pages_height)
+        .max_height(pages_height)
+        .show(ui, |ui| {
+            let mut reorder = crate::list_drag::ListDrag::in_order(ui, "pages");
+            let row_width = ui.available_width();
+            for (k, (id, name, divider)) in pages.iter().cloned().enumerate() {
+                let (r, resp) = ui.allocate_exact_size(vec2(row_width, 32.0), Sense::click_and_drag());
+                reorder.row_by(&resp, k, r, || if divider { tr("Divider").to_string() } else { name.clone() });
+                a11y::list_item(&resp, if divider { tr("Divider") } else { &name }, id == cur);
+                let r = r.shrink2(vec2(8.0, 0.0));
+                a11y::ring_around(ui, r, &resp);
+                let renaming = app.ui.rename_page.as_ref().is_some_and(|(i, _)| *i == id);
+                if divider && !renaming {
+                    // A divider is a line between pages: it opens nothing and takes no layers.
+                    ui.painter().line_segment([pos2(r.min.x + 10.0, r.center().y), pos2(r.max.x - 10.0, r.center().y)], Stroke::new(1.0, t.border));
+                } else if resp.hovered() || id == cur {
+                    ui.painter().rect_filled(r, CornerRadius::same(5), t.hover);
+                }
+                if dragging.is_some()
             && id != cur
             && !divider
             // The gap between rows counts too.
             && pointer.is_some_and(|p| resp.interact_rect.expand2(vec2(0.0, 3.0)).contains(p))
-        {
-            ui.painter().rect_stroke(r, CornerRadius::same(5), Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
-            if ui.input(|i| i.pointer.any_released()) {
-                move_to = Some((id, name.clone()));
+                {
+                    ui.painter().rect_stroke(r, CornerRadius::same(5), Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+                    if ui.input(|i| i.pointer.any_released()) {
+                        move_to = Some((id, name.clone()));
+                    }
+                }
+                if renaming {
+                    let tr = Rect::from_min_max(pos2(r.min.x + 8.0, r.min.y + 4.0), pos2(r.max.x - 4.0, r.max.y - 4.0));
+                    if let Some(new) = crate::widgets::text_field_inline(
+                        ui,
+                        Id::new(("pagename", id)),
+                        &name,
+                        tr,
+                        if id == cur { semibold(11.0) } else { regular(11.0) },
+                    ) {
+                        rename_done = Some((id, new));
+                    }
+                } else if !divider {
+                    let font = if id == cur { semibold(11.0) } else { regular(11.0) };
+                    crate::bidi::paint_name(ui.painter(), pos2(r.min.x + 10.0, r.center().y), &name, font, t.text, r.width() - 14.0);
+                }
+                if resp.clicked() && !divider {
+                    select = Some(id);
+                }
+                if resp.double_clicked() {
+                    app.ui.rename_page = Some((id, name.clone()));
+                    ui.memory_mut(|m| m.request_focus(Id::new(("pagename", id)).with("te")));
+                }
+                crate::right::context_popup(&resp).show(|ui| {
+                    if ui.button(tr("Rename page")).clicked() {
+                        app.ui.rename_page = Some((id, name.clone()));
+                        ui.close();
+                    }
+                    if ui.button(tr("Duplicate page")).clicked() {
+                        app.run("page.duplicate", json!({"id": id}));
+                        ui.close();
+                    }
+                    if ui.button(tr("Delete page")).clicked() {
+                        app.run("page.delete", json!({"id": id}));
+                        ui.close();
+                    }
+                });
             }
-        }
-        if renaming {
-            let tr = Rect::from_min_max(pos2(r.min.x + 8.0, r.min.y + 4.0), pos2(r.max.x - 4.0, r.max.y - 4.0));
-            if let Some(new) =
-                crate::widgets::text_field_inline(ui, Id::new(("pagename", id)), &name, tr, if id == cur { semibold(11.0) } else { regular(11.0) })
-            {
-                rename_done = Some((id, new));
-            }
-        } else if !divider {
-            let font = if id == cur { semibold(11.0) } else { regular(11.0) };
-            crate::bidi::paint_name(ui.painter(), pos2(r.min.x + 10.0, r.center().y), &name, font, t.text, r.width() - 14.0);
-        }
-        if resp.clicked() && !divider {
-            select = Some(id);
-        }
-        if resp.double_clicked() {
-            app.ui.rename_page = Some((id, name.clone()));
-            ui.memory_mut(|m| m.request_focus(Id::new(("pagename", id)).with("te")));
-        }
-        crate::right::context_popup(&resp).show(|ui| {
-            if ui.button(tr("Rename page")).clicked() {
-                app.ui.rename_page = Some((id, name.clone()));
-                ui.close();
-            }
-            if ui.button(tr("Duplicate page")).clicked() {
-                app.run("page.duplicate", json!({"id": id}));
-                ui.close();
-            }
-            if ui.button(tr("Delete page")).clicked() {
-                app.run("page.delete", json!({"id": id}));
-                ui.close();
-            }
+            reorder.finish(ui)
         });
+    let page_list_view = reordered.inner_rect;
+    let drop_inside_pages = ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| page_list_view.contains(p));
+    let reordered = reordered.inner.filter(|_| drop_inside_pages);
+    if !drop_inside_pages {
+        move_to = None;
     }
-    if let Some((from, to)) = reorder.finish(ui)
+    let splitter_id = Id::new("pages_list_splitter");
+    let (splitter, _) = ui.allocate_exact_size(vec2(w, PAGE_SPLITTER_HEIGHT), Sense::hover());
+    let split_resp = ui.interact(splitter, splitter_id, Sense::click_and_drag());
+    if split_resp.drag_started() {
+        let start_y = ui.input(|i| i.pointer.press_origin()).map_or(split_resp.interact_pointer_pos().map_or(0.0, |p| p.y), |p| p.y);
+        ui.data_mut(|d| d.insert_temp(pages_height_drag_id(), (pages_height, start_y)));
+    }
+    if split_resp.dragged() {
+        let pointer_y = split_resp.interact_pointer_pos().map_or(splitter.center().y, |p| p.y);
+        let (start, start_y): (f32, f32) = ui.data(|d| d.get_temp(pages_height_drag_id())).unwrap_or((pages_height, pointer_y));
+        let height = (start + pointer_y - start_y).clamp(min_pages_height, max_pages_height);
+        ui.data_mut(|d| d.insert_persisted(pages_height_id(), height));
+    }
+    if split_resp.drag_stopped() {
+        ui.data_mut(|d| d.remove::<(f32, f32)>(pages_height_drag_id()));
+    }
+    if split_resp.hovered() || split_resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    ui.painter().hline(
+        splitter.x_range().shrink(8.0),
+        splitter.center().y,
+        Stroke::new(1.0, if split_resp.hovered() || split_resp.dragged() { t.accent } else { t.border }),
+    );
+    if let Some((from, to)) = reordered
         && let Some((id, ..)) = pages.get(from)
     {
         app.run("page.move", json!({"id": id, "index": to}));
@@ -664,7 +732,7 @@ fn layers(app: &mut FigApp, ui: &mut Ui) {
     // The drag is over a row that takes no drop: the not-allowed cursor shows.
     let mut refused = false;
     // Only the rows in view are laid out and drawn; the rest is empty scroll space.
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
+    egui::ScrollArea::vertical().auto_shrink([false, false]).min_scrolled_height(0.0).show_viewport(ui, |ui, viewport| {
         let pitch = ROW + ui.spacing().item_spacing.y;
         let top = ui.max_rect().top();
         let total = rows.len() as f32 * pitch;
