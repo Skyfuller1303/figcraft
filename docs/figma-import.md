@@ -146,6 +146,39 @@ URL and asset policy, cancellation, byte budgets, editable images and variables,
 identity and report visibility. They complement the scoped live desktop and Figma writer checks
 below. Successful import alone does not establish visual parity.
 
+The `.fig` message decoder charges retained values against `max(256 MiB, 16 × encoded message
+bytes)`, capped at 1 GiB. This is an accounting budget, not an exact heap ceiling; container growth
+can make actual allocations larger. Value-count, schema and nesting limits remain in force.
+
+**Decoder-budget follow-up (2026-10-14):** A further private file exceeded the former 256 MiB
+decoded-value budget: its 47.38 MiB message required 592.73 MiB of charged values. With the
+source-sized import budget, the Windows release CLI and desktop app open all 29 pages and
+103,263 nodes. A native copy reopens with matching page, node, image, style and variable summaries;
+the source file's hash is unchanged. Five compatibility notes remain, including unavailable
+external components and unresolved instance source links. This verifies the decoder rejection
+fix, not the visual misalignment reported in issue #329. The exporter retains its conservative
+256 MiB decoded-value admission budget.
+
+Component overrides can address a materialized child by its original `overrideKey` rather than
+its current GUID. The importer resolves unique explicit aliases within the selected main,
+one instance boundary at a time, including swapped and nested instances. Current GUIDs take
+precedence; ambiguous aliases remain unresolved. Source identities and override precedence are
+preserved. Synthetic tests cover ordinary frame descendants, nested priority, mixed alias/current
+paths, swaps, ambiguity and two export/reimport rounds. Missing local fonts remain a separate
+rendering limitation even when the imported family and style metadata are correct.
+
+Direct paint color bindings are applied when a document is opened, before establishing the saved
+baseline. A paint's stale literal fallback therefore does not replace the current bound color,
+including on pages that have not yet been selected. This initialization does not run a full
+layout normalization or applying geometry and component-property bindings.
+
+The decoder-only Windows workspace run passed 2,362 tests with six ignored. Its first Ubuntu run
+failed two recovery tests; the recovery suite passed separately and a complete unchanged-source
+rerun passed 2,364 tests with six ignored. The later alias-mapping run passed 2,365 Windows and
+2,367 Ubuntu tests, with six ignored on each. Format, Clippy, layers and assets passed on both
+platforms, and Ubuntu WASM passed. That run's aggregate result was blocked because documentation
+changed during the checks. These counts include sample-gated tests without private samples.
+
 The local Windows/Ubuntu CI run passes all 11 checks. Fresh Windows GUI and CLI release builds
 were exercised, and a separate synthetic local interoperability check passes 404 assertions.
 

@@ -21,6 +21,7 @@ const MAX_SCHEMA_NAME: usize = 1024;
 const MAX_SCHEMA_NAME_BYTES: usize = 16 * 1024 * 1024;
 /// Retained decoded strings, blobs and value cells; a value count alone does not cap allocations.
 pub(super) const MAX_DECODE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_IMPORT_DECODE_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct KiwiError(pub String);
@@ -310,9 +311,26 @@ impl Schema {
 
     /// Decode a message of definition `root`.
     pub fn decode_message<'s>(&'s self, root: usize, data: &[u8]) -> Result<Kv<'s>, KiwiError> {
-        let mut d = Decoder { schema: self, r: Reader { data, pos: 0 }, budget: MAX_VALUES, byte_budget: MAX_DECODE_BYTES };
+        self.decode_message_with_budget(root, data, MAX_DECODE_BYTES)
+    }
+
+    /// Decode an imported message with headroom proportional to its encoded size, capped at 1 GiB.
+    pub(super) fn decode_import_message<'s>(&'s self, root: usize, data: &[u8]) -> Result<Kv<'s>, KiwiError> {
+        self.decode_message_with_budget(root, data, import_decode_budget(data.len()))
+    }
+
+    fn decode_message_with_budget<'s>(&'s self, root: usize, data: &[u8], byte_budget: usize) -> Result<Kv<'s>, KiwiError> {
+        let mut d = Decoder { schema: self, r: Reader { data, pos: 0 }, budget: MAX_VALUES, byte_budget };
         d.def(root, 0)
     }
+}
+
+fn import_decode_budget(encoded_bytes: usize) -> usize {
+    decode_budget(encoded_bytes, 256 * 1024 * 1024, MAX_IMPORT_DECODE_BYTES)
+}
+
+fn decode_budget(encoded_bytes: usize, minimum: usize, maximum: usize) -> usize {
+    minimum.max(encoded_bytes.saturating_mul(16)).min(maximum)
 }
 
 struct Decoder<'s, 'b> {
@@ -791,5 +809,32 @@ mod budget_tests {
         let schema = Schema::parse("message Message string value").unwrap();
         assert!(decode_with_budget(&schema, &[1, 0xff, 0, 0], field + 2).is_err());
         assert!(decode_with_budget(&schema, &[1, 0xff, 0, 0], field + 3).is_ok());
+    }
+
+    #[test]
+    fn import_decode_budget_has_minimum_scaling_hard_max_and_saturates() {
+        const MIB: usize = 1024 * 1024;
+        assert_eq!(import_decode_budget(0), 256 * MIB);
+        assert_eq!(import_decode_budget(16 * MIB), 256 * MIB);
+        assert_eq!(import_decode_budget(17 * MIB), 272 * MIB);
+        assert_eq!(import_decode_budget(50 * MIB), 800 * MIB);
+        assert_eq!(import_decode_budget(64 * MIB), MAX_IMPORT_DECODE_BYTES);
+        assert_eq!(import_decode_budget(usize::MAX), MAX_IMPORT_DECODE_BYTES);
+    }
+
+    #[test]
+    fn scaled_import_budget_admits_values_rejected_by_scaled_legacy_limit() {
+        let schema = Schema::parse("message Message string[] values").unwrap();
+        let mut data = vec![1, 100];
+        for _ in 0..100 {
+            data.extend(std::iter::repeat_n(b'x', 100));
+            data.push(0);
+        }
+        data.push(0);
+        // Scale down the production floor and cap while exercising the same budget function.
+        let old_budget = decode_budget(data.len(), 256, 256);
+        let scaled_budget = decode_budget(data.len(), 256, 1024 * 1024);
+        assert!(decode_with_budget(&schema, &data, old_budget).unwrap_err().0.contains("byte budget"));
+        assert!(decode_with_budget(&schema, &data, scaled_budget).is_ok());
     }
 }

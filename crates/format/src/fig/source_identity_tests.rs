@@ -1,5 +1,6 @@
 //! Synthetic .fig source identity: contextual overrides, main switches and invalid provenance.
 
+use figcraft_doc::color::PaintKind;
 use figcraft_doc::{Document, NodeId, NodeKind};
 use serde_json::{Value, json};
 
@@ -41,6 +42,201 @@ fn row(path: &[u64], more: Fields) -> Kv<'static> {
     let mut fields = vec![("guidPath", o(vec![("guids", Kv::Array(path.iter().map(|id| g(*id)).collect()))]))];
     fields.extend(more);
     o(fields)
+}
+
+fn alias_schema() -> Schema {
+    let schema = export::SCHEMA.replace("message NodeChange GUID guid=1,", "message NodeChange GUID guid=1, GUID overrideKey=500,");
+    Schema::parse(&schema).unwrap()
+}
+
+fn solid(r: f32, g: f32, b: f32) -> Kv<'static> {
+    o(vec![
+        ("type", Kv::Enum("SOLID")),
+        ("color", o(vec![("r", Kv::Float(r)), ("g", Kv::Float(g)), ("b", Kv::Float(b)), ("a", Kv::Float(1.0))])),
+        ("opacity", Kv::Float(1.0)),
+        ("visible", Kv::Bool(true)),
+    ])
+}
+
+fn alias(id: u64) -> Fields {
+    vec![("overrideKey", g(id))]
+}
+
+fn import_alias_message(message: Kv<'static>) -> Document {
+    let schema = alias_schema();
+    let bytes = super::tests::canvas(&schema, &message);
+    let (doc, warnings) = import(&bytes, "Alias.fig").unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    doc
+}
+
+fn fill_rgb(doc: &Document, name: &str) -> Option<[f64; 3]> {
+    let node = doc.nodes().find(|n| n.name == name)?;
+    fill_rgb_node(doc, node.id)
+}
+
+fn fill_rgb_node(doc: &Document, id: NodeId) -> Option<[f64; 3]> {
+    let node = doc.node(id)?;
+    match &node.fills.first()?.kind {
+        PaintKind::Solid { color } => Some([f64::from(color.r), f64::from(color.g), f64::from(color.b)]),
+        _ => None,
+    }
+}
+
+fn alias_priority_message() -> Kv<'static> {
+    let nested_local = symbol(10, vec![row(&[112], vec![("fillPaints", Kv::Array(vec![solid(0.0, 0.0, 1.0)]))])]);
+    o(vec![(
+        "nodeChanges",
+        Kv::Array(vec![
+            node(1, None, "DOCUMENT", "Document", vec![]),
+            node(2, Some(1), "CANVAS", "Page", vec![]),
+            node(10, Some(2), "SYMBOL", "Inner main", vec![]),
+            node(11, Some(10), "FRAME", "Normal frame", vec![]),
+            node(12, Some(11), "ROUNDED_RECTANGLE", "Alias leaf", alias(112)),
+            node(20, Some(2), "SYMBOL", "Outer main", vec![]),
+            node(
+                21,
+                Some(20),
+                "INSTANCE",
+                "Nested slot",
+                vec![
+                    ("overrideKey", g(221)),
+                    ("symbolData", nested_local),
+                    ("derivedSymbolData", Kv::Array(vec![row(&[112], vec![("opacity", Kv::Float(0.25))])])),
+                ],
+            ),
+            node(
+                30,
+                Some(2),
+                "INSTANCE",
+                "Alias copy",
+                vec![
+                    (
+                        "symbolData",
+                        symbol(
+                            20,
+                            vec![
+                                row(&[221, 112], vec![("fillPaints", Kv::Array(vec![solid(0.0, 1.0, 0.0)]))]),
+                                row(&[21, 12], vec![("fillPaints", Kv::Array(vec![solid(1.0, 0.0, 0.0)]))]),
+                            ],
+                        ),
+                    ),
+                    ("derivedSymbolData", Kv::Array(vec![row(&[221, 112], vec![("fillPaints", Kv::Array(vec![solid(1.0, 0.5, 0.0)]))])])),
+                ],
+            ),
+        ]),
+    )])
+}
+
+#[test]
+fn override_aliases_normalize_lazily_and_keep_outer_wire_order() {
+    let mut doc = import_alias_message(alias_priority_message());
+    let main = named(&doc, "Inner main");
+    let leaf = child(&doc, child(&doc, main, 0), 0);
+    let outer_main = named(&doc, "Outer main");
+    let main_slot = child(&doc, outer_main, 0);
+    let main_leaf = child(&doc, child(&doc, main_slot, 0), 0);
+    let copy = named(&doc, "Alias copy");
+    let nested = child(&doc, copy, 0);
+    let frame = child(&doc, nested, 0);
+    let expanded_leaf = child(&doc, frame, 0);
+    assert_eq!(doc.node(main_leaf).unwrap().source, Some(leaf));
+    assert_eq!(doc.node(expanded_leaf).unwrap().source, Some(main_leaf));
+    assert_eq!(fill_rgb_node(&doc, expanded_leaf), Some([1.0, 0.5, 0.0]));
+    assert_eq!(doc.node(expanded_leaf).unwrap().opacity, 0.25);
+    assert_eq!(fill_rgb_node(&doc, leaf), None, "source node stays unchanged");
+
+    // Export writes current GUID paths. Reimport keeps the selected outer paint and actual provenance.
+    for round in 1..=2 {
+        let (bytes, warnings) = export(&doc, None).unwrap();
+        assert!(warnings.is_empty(), "round {round}: {warnings:?}");
+        let (back, notes) = import(&bytes, "Alias.fig").unwrap();
+        assert!(notes.is_empty(), "round {round}: {notes:?}");
+        let main = named(&back, "Inner main");
+        let leaf = child(&back, child(&back, main, 0), 0);
+        let outer_main = named(&back, "Outer main");
+        let main_leaf = child(&back, child(&back, child(&back, outer_main, 0), 0), 0);
+        let copy = named(&back, "Alias copy");
+        let expanded_leaf = child(&back, child(&back, child(&back, copy, 0), 0), 0);
+        assert_eq!(back.node(main_leaf).unwrap().source, Some(leaf));
+        assert_eq!(back.node(expanded_leaf).unwrap().source, Some(main_leaf));
+        assert_eq!(fill_rgb_node(&back, expanded_leaf), Some([1.0, 0.5, 0.0]));
+        doc = back;
+    }
+}
+
+#[test]
+fn selected_swapped_main_owns_alias_resolution_scope() {
+    let message = o(vec![(
+        "nodeChanges",
+        Kv::Array(vec![
+            node(1, None, "DOCUMENT", "Document", vec![]),
+            node(2, Some(1), "CANVAS", "Page", vec![]),
+            node(10, Some(2), "SYMBOL", "Old main", vec![]),
+            node(11, Some(10), "ROUNDED_RECTANGLE", "Old leaf", alias(112)),
+            node(20, Some(2), "SYMBOL", "Swapped main", vec![]),
+            node(21, Some(20), "ROUNDED_RECTANGLE", "Swapped leaf", alias(112)),
+            node(
+                30,
+                Some(2),
+                "INSTANCE",
+                "Swap",
+                vec![
+                    ("overriddenSymbolID", g(20)),
+                    ("symbolData", symbol(10, vec![row(&[112], vec![("fillPaints", Kv::Array(vec![solid(1.0, 0.0, 0.0)]))])])),
+                ],
+            ),
+        ]),
+    )]);
+    let doc = import_alias_message(message);
+    let copy = named(&doc, "Swap");
+    let source = named(&doc, "Swapped leaf");
+    let expanded = child(&doc, copy, 0);
+    assert_eq!(doc.node(expanded).unwrap().source, Some(source));
+    assert_eq!(fill_rgb_node(&doc, expanded), Some([1.0, 0.0, 0.0]));
+    assert_eq!(fill_rgb(&doc, "Old leaf"), None);
+}
+
+#[test]
+fn ambiguous_alias_is_ignored_but_current_guid_still_matches() {
+    let message = o(vec![(
+        "nodeChanges",
+        Kv::Array(vec![
+            node(1, None, "DOCUMENT", "Document", vec![]),
+            node(2, Some(1), "CANVAS", "Page", vec![]),
+            node(10, Some(2), "SYMBOL", "Main", vec![]),
+            node(11, Some(10), "ROUNDED_RECTANGLE", "First", alias(13)),
+            node(12, Some(10), "ROUNDED_RECTANGLE", "Second", alias(112)),
+            node(13, Some(10), "ROUNDED_RECTANGLE", "Current GUID", alias(112)),
+            node(
+                20,
+                Some(2),
+                "INSTANCE",
+                "Copy",
+                vec![(
+                    "symbolData",
+                    symbol(
+                        10,
+                        vec![
+                            row(&[112], vec![("fillPaints", Kv::Array(vec![solid(1.0, 0.0, 0.0)]))]),
+                            row(&[13], vec![("fillPaints", Kv::Array(vec![solid(0.0, 0.0, 1.0)]))]),
+                        ],
+                    ),
+                )],
+            ),
+        ]),
+    )]);
+    let doc = import_alias_message(message);
+    let copy = named(&doc, "Copy");
+    let first = child(&doc, copy, 0);
+    let second = child(&doc, copy, 1);
+    let current = child(&doc, copy, 2);
+    assert_eq!(doc.node(first).unwrap().source, Some(named(&doc, "First")));
+    assert_eq!(fill_rgb_node(&doc, first), None, "ambiguous alias must not be guessed");
+    assert_eq!(doc.node(second).unwrap().source, Some(named(&doc, "Second")));
+    assert_eq!(fill_rgb_node(&doc, second), None, "ambiguous alias must not match either target");
+    assert_eq!(doc.node(current).unwrap().source, Some(named(&doc, "Current GUID")));
+    assert_eq!(fill_rgb_node(&doc, current), Some([0.0, 0.0, 1.0]), "a current GUID outranks an alias with the same key");
 }
 
 fn message(swapped: bool) -> Kv<'static> {

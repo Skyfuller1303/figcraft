@@ -6,7 +6,7 @@
 //! are expanded here from the main component (overrides and derived layout matched by id path,
 //! component property values applied) so the import looks as saved.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use figcraft_doc::geom::{Affine, Point};
@@ -72,6 +72,16 @@ fn num(n: &Kv, k: &str) -> Option<f64> {
 
 fn guid(v: &Kv) -> Option<String> {
     Some(format!("{}:{}", num(v, "sessionID")? as u64, num(v, "localID")? as u64))
+}
+
+fn normalize_override_segment(path: &mut [String], index: usize, scope: &OverrideScope) {
+    let Some(segment) = path.get(index) else { return };
+    if scope.current.contains(segment) {
+        return;
+    }
+    if let Some(Some(current)) = scope.aliases.get(segment) {
+        path[index] = current.clone();
+    }
 }
 
 /// A `GUID`-holding reference (`StyleId`, `VariableID`, …): its `guid`.
@@ -174,10 +184,22 @@ impl<'a> View<'a> {
 struct Inst<'a> {
     root: String,
     path: Vec<String>,
-    overrides: Rc<BTreeMap<Vec<String>, Vec<&'a Kv<'a>>>>,
+    overrides: Rc<BTreeMap<Vec<String>, Vec<OverrideRow<'a>>>>,
     props: Rc<BTreeMap<String, &'a Kv<'a>>>,
     /// Mains being expanded (an instance inside its own main stops there).
     symbols: Vec<String>,
+}
+
+#[derive(Clone)]
+struct OverrideRow<'a> {
+    row: &'a Kv<'a>,
+    source_depth: usize,
+    ordinal: usize,
+}
+
+struct OverrideScope {
+    current: BTreeSet<String>,
+    aliases: BTreeMap<String, Option<String>>,
 }
 
 struct Mapper<'a> {
@@ -191,6 +213,8 @@ struct Mapper<'a> {
     /// Descriptions of components and component sets (REST `components` / `componentSets`).
     components: Obj,
     sets: Obj,
+    override_scopes: BTreeMap<String, Rc<OverrideScope>>,
+    override_scope_entries: usize,
     warnings: Vec<String>,
     count: usize,
 }
@@ -243,6 +267,8 @@ impl<'a> Mapper<'a> {
             styles: Obj::new(),
             components: Obj::new(),
             sets: Obj::new(),
+            override_scopes: BTreeMap::new(),
+            override_scope_entries: 0,
             warnings: Vec::new(),
             count: 0,
         }
@@ -257,6 +283,67 @@ impl<'a> Mapper<'a> {
 
     fn children(&self, id: &str) -> Vec<String> {
         self.kids.get(id).map(|k| k.iter().map(|(_, c)| c.clone()).collect()).unwrap_or_default()
+    }
+
+    fn override_scope(&mut self, main: &str) -> Rc<OverrideScope> {
+        if let Some(scope) = self.override_scopes.get(main) {
+            return Rc::clone(scope);
+        }
+        let mut current = BTreeSet::new();
+        let mut aliases: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut visited = BTreeSet::new();
+        let roots = self.kids.get(main).map_or(&[][..], Vec::as_slice);
+        let mut pending: Vec<(String, usize)> = Vec::new();
+        let mut complete = roots.len() <= MAX_NODES;
+        if complete {
+            pending.extend(roots.iter().map(|(_, id)| (id.clone(), 1)));
+        }
+        while let Some((id, depth)) = pending.pop() {
+            if depth > MAX_DEPTH {
+                complete = false;
+                break;
+            }
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            if visited.len() > MAX_NODES {
+                complete = false;
+                break;
+            }
+            let Some(node) = self.nodes.get(&id) else { continue };
+            current.insert(id.clone());
+            if let Some(alias) = node.get("overrideKey").and_then(guid) {
+                match aliases.entry(alias) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(Some(id.clone()));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if entry.get().as_deref().is_some_and(|target| target != id) {
+                            entry.insert(None);
+                        }
+                    }
+                }
+            }
+            if node.get("type").and_then(Kv::str) == Some("INSTANCE") {
+                continue;
+            }
+            let children = self.kids.get(&id).map_or(&[][..], Vec::as_slice);
+            if pending.len().saturating_add(visited.len()).saturating_add(children.len()) > MAX_NODES {
+                complete = false;
+                break;
+            }
+            pending.extend(children.iter().map(|(_, child)| (child.clone(), depth + 1)));
+        }
+        if !complete {
+            aliases.clear();
+        }
+        let scope = Rc::new(OverrideScope { current, aliases });
+        let cost = scope.current.len().saturating_add(scope.aliases.len());
+        if cost <= MAX_NODES.saturating_sub(self.override_scope_entries) {
+            self.override_scope_entries += cost;
+            self.override_scopes.insert(main.to_string(), Rc::clone(&scope));
+        }
+        scope
     }
 
     /// The DOCUMENT with its pages.
@@ -331,7 +418,7 @@ impl<'a> Mapper<'a> {
         let base = *self.nodes.get(id)?;
         let path = inst.map(|i| [i.path.as_slice(), &[id.to_string()]].concat());
         let view = match (inst, &path) {
-            (Some(i), Some(p)) => View::of(base).with(i.overrides.get(p).into_iter().flatten().copied()),
+            (Some(i), Some(p)) => View::of(base).with(i.overrides.get(p).into_iter().flatten().map(|row| row.row)),
             _ => View::of(base),
         };
         let rest_id = match (inst, &path) {
@@ -965,26 +1052,41 @@ impl<'a> Mapper<'a> {
         }
         // Overrides by id path below this instance (the instance itself is addressed by its main's id).
         let own_path: Vec<String> = outer.map(|i| [i.path.as_slice(), &[id.to_string()]].concat()).unwrap_or_default();
-        let mut overrides: BTreeMap<Vec<String>, Vec<&'a Kv<'a>>> = outer.map(|i| (*i.overrides).clone()).unwrap_or_default();
-        let mut local: BTreeMap<Vec<String>, Vec<&'a Kv<'a>>> = BTreeMap::new();
+        let scope = self.override_scope(&sym);
+        let mut overrides: BTreeMap<Vec<String>, Vec<OverrideRow<'a>>> = BTreeMap::new();
+        if let Some(inherited) = outer {
+            for (path, rows) in inherited.overrides.iter() {
+                let mut path = path.clone();
+                if path.starts_with(&own_path) && path.len() > own_path.len() {
+                    normalize_override_segment(&mut path, own_path.len(), &scope);
+                }
+                overrides.entry(path).or_default().extend(rows.iter().cloned());
+            }
+        }
+        let mut local: BTreeMap<Vec<String>, Vec<OverrideRow<'a>>> = BTreeMap::new();
         let lists = [sd.and_then(|s| s.get("symbolOverrides")).map(Kv::list).unwrap_or_default(), v.list("derivedSymbolData")];
+        let source_depth = outer.map_or(0, |i| i.symbols.len());
+        let mut ordinal = 0;
         for list in lists {
             for ov in list {
+                let row_ordinal = ordinal;
+                ordinal += 1;
                 let rel: Vec<String> =
                     ov.get("guidPath").and_then(|g| g.get("guids")).map(Kv::list).unwrap_or_default().iter().filter_map(guid).collect();
                 if rel.is_empty() || rel == [sym.clone()] {
                     continue;
                 }
-                local.entry([own_path.as_slice(), &rel].concat()).or_default().push(ov);
+                let mut rel = rel;
+                normalize_override_segment(&mut rel, 0, &scope);
+                local.entry([own_path.as_slice(), &rel].concat()).or_default().push(OverrideRow { row: ov, source_depth, ordinal: row_ordinal });
             }
         }
-        for (path, mut rows) in local {
-            // Local rows keep their order, with derived layout after explicit overrides. Append
-            // the inherited outer block once so it wins without repeatedly shifting local rows.
-            if let Some(inherited) = overrides.get_mut(&path) {
-                rows.append(inherited);
-            }
-            overrides.insert(path, rows);
+        for (path, rows) in local {
+            overrides.entry(path).or_default().extend(rows);
+        }
+        for rows in overrides.values_mut() {
+            // Deeper source rows apply first; outer rows win, with wire order preserved per source.
+            rows.sort_by_key(|row| (std::cmp::Reverse(row.source_depth), row.ordinal));
         }
         let mut all_props: BTreeMap<String, &'a Kv<'a>> = outer.map(|i| (*i.props).clone()).unwrap_or_default();
         for a in assignments {

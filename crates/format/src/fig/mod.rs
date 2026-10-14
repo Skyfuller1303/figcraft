@@ -82,7 +82,7 @@ pub fn import(bytes: &[u8], name: &str) -> Result<(Document, Vec<String>), Forma
     let archive = Archive::open(bytes)?;
     let (schema, message) = decode_canvas(&archive.canvas)?;
     let root = schema.find("Message").ok_or_else(|| corrupt("the schema has no Message definition"))?;
-    let msg = schema.decode_message(root, &message).map_err(|e| corrupt(e.to_string()))?;
+    let msg = schema.decode_import_message(root, &message).map_err(|e| corrupt(e.to_string()))?;
     let file_name = archive.file_name.as_deref().filter(|n| !n.trim().is_empty()).unwrap_or(name);
     let (json, mut warnings) = map::to_rest(&msg, file_name)?;
     let embedded = embedded_images(&msg, &archive.image_limits_hit);

@@ -187,6 +187,15 @@ fn stage_b_multiple_override_rows_keep_local_and_outer_priority() {
             .map(|value| o(vec![("guidPath", o(vec![("guids", arr(path.iter().map(|id| guid(LAYERS, *id)).collect()))])), ("opacity", fl(value))]))
             .collect())
     }
+    fn collision_rows(alias_path: &[u32], current_path: &[u32], values: [f64; 2]) -> Kv<'static> {
+        arr([alias_path, current_path]
+            .into_iter()
+            .zip(values)
+            .map(|(path, value)| {
+                o(vec![("guidPath", o(vec![("guids", arr(path.iter().map(|id| guid(LAYERS, *id)).collect()))])), ("opacity", fl(value))])
+            })
+            .collect())
+    }
     fn symbol(main: u32, path: &[u32], values: [f64; 2]) -> Kv<'static> {
         o(vec![("symbolID", guid(LAYERS, main)), ("symbolOverrides", rows(path, values))])
     }
@@ -196,21 +205,24 @@ fn stage_b_multiple_override_rows_keep_local_and_outer_priority() {
             node(0, None, "DOCUMENT", "Document", vec![]),
             node(1, Some((0, "a")), "CANVAS", "Page", vec![]),
             node(2, Some((1, "a")), "SYMBOL", "Inner", vec![]),
-            node(3, Some((2, "a")), "ROUNDED_RECTANGLE", "Rect", vec![("opacity", fl(1.0))]),
+            node(3, Some((2, "a")), "ROUNDED_RECTANGLE", "Rect", vec![("overrideKey", guid(LAYERS, 33)), ("opacity", fl(1.0))]),
             node(4, Some((1, "b")), "SYMBOL", "Outer", vec![]),
             node(
                 5,
                 Some((4, "a")),
                 "INSTANCE",
                 "Nested",
-                vec![("symbolData", symbol(2, &[3], [0.1, 0.2])), ("derivedSymbolData", rows(&[3], [0.3, 0.4]))],
+                vec![("overrideKey", guid(LAYERS, 55)), ("symbolData", symbol(2, &[3], [0.1, 0.2])), ("derivedSymbolData", rows(&[3], [0.3, 0.4]))],
             ),
             node(
                 6,
                 Some((1, "c")),
                 "INSTANCE",
                 "Outer copy",
-                vec![("symbolData", symbol(4, &[5, 3], [0.5, 0.6])), ("derivedSymbolData", rows(&[5, 3], [0.7, 0.8]))],
+                vec![
+                    ("symbolData", o(vec![("symbolID", guid(LAYERS, 4)), ("symbolOverrides", collision_rows(&[55, 33], &[5, 3], [0.5, 0.6]))])),
+                    ("derivedSymbolData", collision_rows(&[55, 33], &[5, 3], [0.7, 0.8])),
+                ],
             ),
             node(7, Some((1, "d")), "INSTANCE", "Local explicit", vec![("symbolData", symbol(2, &[3], [0.1, 0.2]))]),
             node(
