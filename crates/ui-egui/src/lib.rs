@@ -22,6 +22,7 @@ pub mod dev_mode;
 pub mod dialogs;
 pub mod export_panel;
 pub mod field_math;
+pub mod figma_import;
 pub mod font_preview;
 pub mod frame_labels;
 pub mod frame_presets;
@@ -32,6 +33,7 @@ pub mod home;
 pub mod home_recents;
 pub mod i18n;
 pub mod icons;
+pub mod import_report;
 pub mod layers;
 pub mod layout_panel;
 pub mod list_drag;
@@ -91,6 +93,8 @@ mod home_tests;
 #[cfg(test)]
 mod idle_tests;
 #[cfg(test)]
+mod import_report_tests;
+#[cfg(test)]
 mod layers_behaviour_tests;
 #[cfg(test)]
 mod layers_drag_tests;
@@ -140,6 +144,8 @@ mod proto_editor_tests;
 mod proto_reorder_tests;
 #[cfg(test)]
 mod proto_responsive_tests;
+#[cfg(test)]
+mod save_as_tests;
 #[cfg(test)]
 mod shortcut_keys_tests;
 #[cfg(test)]
@@ -337,6 +343,11 @@ pub struct UiState {
     pub follow_system: bool,
     pub tool_flyout: Option<&'static str>,
     pub last_error: Option<String>,
+    /// The latest successful file import's summary and compatibility notes.
+    pub import_report: Option<import_report::Report>,
+    /// A desktop Figma import; its token is never part of `ui.inspect` or preferences.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub figma_import: Option<figma_import::Dialog>,
     /// Files dropped on the home screen or the canvas, opened once their card has been on screen
     /// ([`pending_open::pending_opens`]), and the frames it has been drawn.
     pub pending_opens: Vec<pending_open::PendingOpen>,
@@ -441,6 +452,9 @@ impl Default for UiState {
             follow_system: false,
             tool_flyout: None,
             last_error: None,
+            import_report: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            figma_import: None,
             pending_opens: Vec::new(),
             pending_open_frames: 0,
             screenshot_requests: Vec::new(),
@@ -544,7 +558,11 @@ impl FigApp {
     pub fn run(&mut self, id: &str, params: Value) -> Option<Value> {
         let r = self.session.execute(id, &params);
         self.handle_ui_requests();
-        r.map_err(|e| self.failed(id, &e)).ok()
+        let result = r.map_err(|e| self.failed(id, &e)).ok();
+        if let Some(result) = &result {
+            import_report::capture(self, id, result);
+        }
+        result
     }
 
     /// Show command `id`'s error.
@@ -689,6 +707,7 @@ impl FigApp {
                     self.services.save_prefs(&self.session.prefs);
                 }
                 "dialog.saveAs" => self.save_as_dialog(),
+                "dialog.importFigma" => figma_import::open(self),
                 "dialog.colorProfile" => self.ui.color_profile = self.session.doc().ok().map(|d| d.color_profile),
                 "present" => {
                     if let Some(start) = r.data.get("start").and_then(figcraft_engine::params::id_of) {
@@ -796,19 +815,46 @@ impl FigApp {
     }
 
     pub fn save_as_dialog(&mut self) {
-        let name = self.session.doc().map(|d| d.name.clone()).unwrap_or_else(|_| "Untitled".into());
-        if let Some(p) = self.services.pick_save(i18n::tr("Save as"), &format!("{name}.figcraft"), &["figcraft"]) {
-            let ps = p.to_string_lossy().to_string();
-            if self.run("file.saveAs", json!({"path": ps})).is_some() {
-                self.toast(i18n::trf("Saved {name}", &[("name", &p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())]));
+        let Ok(name) = self.session.doc().map(|d| d.name.clone()) else { return };
+        // A dotted name ("Brand v1.2") already looks like it has an extension, so the system dialog wouldn't add one.
+        let suggested = if Path::new(&name).extension().is_some_and(|e| !e.is_empty()) { format!("{name}.figcraft") } else { name };
+        let Some(mut p) = self.services.pick_save(i18n::tr("Save as"), &suggested, &["figcraft", "fig"]) else { return };
+        if p.extension().is_none_or(|e| e.is_empty()) {
+            if !p.set_extension("figcraft") {
+                self.toast(i18n::tr("Use the .figcraft or .fig extension."));
+                return;
             }
+            // This name wasn't confirmed by the system dialog: don't replace an existing file.
+            match p.try_exists() {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.toast(i18n::tr("A .figcraft file with this name already exists. Choose its full name to confirm replacement."));
+                    return;
+                }
+                Err(e) => {
+                    self.toast(e.to_string());
+                    return;
+                }
+            }
+        } else if !p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("figcraft") || e.eq_ignore_ascii_case("fig")) {
+            self.toast(i18n::tr("Use the .figcraft or .fig extension."));
+            return;
+        }
+        if let Some(r) = self.run("file.saveAs", json!({"path": p.to_string_lossy()})) {
+            dialogs::file_saved(self, &r);
         }
     }
 
     pub fn save(&mut self) {
         // A branch tab saves its main file.
         let tab = figcraft_engine::branches::file_tab(&self.session);
-        if self.session.docs.get(tab).is_some_and(|d| d.path.is_some()) {
+        let native_path = self
+            .session
+            .docs
+            .get(tab)
+            .and_then(|d| d.path.as_deref())
+            .is_some_and(|path| !Path::new(path).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("fig")));
+        if native_path {
             if self.run("file.save", json!({})).is_some() {
                 self.toast(i18n::tr("Saved"));
             }
@@ -830,7 +876,7 @@ impl FigApp {
         let exts: &[&str] = if place {
             &["png", "jpg", "jpeg", "webp", "gif", "tif", "tiff"]
         } else {
-            &["svg", "png", "jpg", "jpeg", "webp", "gif", "tif", "tiff", "figcraft", "fig"]
+            &["svg", "png", "jpg", "jpeg", "webp", "gif", "tif", "tiff", "figcraft", "fig", "json"]
         };
         if let Some(p) = self.services.pick_open(if place { i18n::tr("Place image") } else { i18n::tr("Import") }, exts) {
             let ps = p.to_string_lossy().to_string();
@@ -990,6 +1036,8 @@ impl FigApp {
         // The Inspect tab measures on hover without Alt.
         self.session.tool.redlines = self.ui.right_tab == RightTab::Inspect;
         if self.ui.present.is_some() {
+            // Keep draining a running Figma import so its worker never blocks on a full channel.
+            figma_import::poll(self, &ctx);
             present::show(self, ui);
             // What went wrong while presenting (a widget's plugin failing) shows over it.
             self.toast_ui(&ctx);
@@ -1196,7 +1244,9 @@ impl FigApp {
             "status": self.session.status(),
             "lastError": self.ui.last_error,
         });
+        state["figmaImport"] = figma_import::inspect(self);
         state["pendingOpens"] = json!(self.ui.pending_opens.len());
+        state["importReport"] = json!(self.ui.import_report.as_ref().map(import_report::Report::inspect));
         state
     }
 }
