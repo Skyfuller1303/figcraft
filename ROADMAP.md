@@ -312,6 +312,7 @@ Ranked; detail and milestones in [`docs/roadmap.md`](docs/roadmap.md).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | minor | Dialogs open as centred cards over a dimmed backdrop; files dropped anywhere on the window open (home) or import (canvas) with a pending-open card. Scores/estimates unchanged |
 | 2026-10-14 | minor | Home screen recent files as cards (M7): each card shows the picture its file carries on its first page's colour, the file's icon, name and "Edited ... ago"; sort by name, creation or last change either way; a table view; a click selects, a double-click or Enter opens, arrow keys move; Open, Show in folder and Remove from recents on right-click. Numbers unchanged. |
 | 2026-10-14 | minor | Lost images reported on loading (#207): a `.figcraft` file whose image member is damaged, too large or missing no longer loads in silence; each lost image (up to 20, then a count) is listed in `repairs` on `file.open` with its hash and the reason, and the app shows it as a toast. Saving still writes the file without the lost images. Numbers unchanged |
 | 2026-10-14 | minor | SVG import budgets (#190): gzipped SVG is unpacked by FigCraft within 64 MiB before parsing (it was unpacked without a limit), so the nesting check sees the real document; SVG documents embedded in `<image>` data URIs share one 32 MiB budget and at most 4 levels, and one past a budget is left out. Linked files stay unread. Numbers unchanged |

@@ -280,3 +280,95 @@ fn tab_walks_the_sidebar_in_order_before_a_sections_controls() {
     let at = |name: &str| names.iter().position(|n| n == name).unwrap_or_else(|| panic!("Tab never reached {name:?}: {names:?}"));
     assert!(at("Recents") < at("Online") && at("Online") < at("Templates") && at("Templates") < at("Open file"), "{names:?}");
 }
+
+/// A temporary directory of its own for a test's files, removed with them when dropped.
+struct Temp(std::path::PathBuf);
+
+impl Temp {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("figcraft-home-drop-{}-{stamp}-{n}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Temp {
+    fn drop(&mut self) {
+        if let Ok(files) = std::fs::read_dir(&self.0) {
+            for file in files.flatten() {
+                let _ = std::fs::remove_file(file.path());
+            }
+        }
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+/// A file dropped on the window, as the windowing backend hands it over (read from its path).
+#[derive(Debug)]
+struct Dropped(std::path::PathBuf);
+
+impl egui::DroppedFile for Dropped {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+/// Drag `path` over the window (one frame: what it shows), then drop it (one frame).
+fn drop_file(u: &mut Ui, path: &std::path::Path) -> Vec<Shape> {
+    let hovered = egui::HoveredFile { path: Some(path.to_path_buf()), mime: String::new() };
+    let hovering = flat(&u.frame_raw(egui::RawInput { hovered_files: vec![hovered], ..Default::default() }).shapes);
+    let file: egui::DroppedFileHandle = std::sync::Arc::new(Dropped(path.to_path_buf()));
+    u.frame_raw(egui::RawInput { dropped_files: vec![file], ..Default::default() });
+    hovering
+}
+
+#[test]
+fn dropping_a_native_file_on_the_home_screen_opens_it() {
+    let dir = Temp::new();
+    let path = dir.path("Dropped.figcraft");
+    let mut saved = Session::new();
+    saved.execute("file.saveAs", &json!({"path": path.to_string_lossy()})).unwrap();
+    assert!(path.exists());
+    let mut u = first_run();
+    u.app.ui.home = true;
+    let s = drop_file(&mut u, &path);
+    assert!(has_text(&s, "Drop to open"), "dragging over the home screen says what a drop does");
+    // The file waits behind its card, which is on screen before it opens.
+    assert_eq!(u.app.ui.pending_opens.len(), 1);
+    assert!(u.app.session.docs.is_empty(), "nothing opens in the frame of the drop");
+    let s = flat(&u.frame_output(vec![]).shapes);
+    assert!(has_text(&s, "Importing to Drafts") && has_text(&s, "Opening the file…") && has_text(&s, "Dropped.figcraft"), "the card shows");
+    assert_eq!(u.app.ui.pending_opens.len(), 1);
+    assert!(u.app.session.docs.is_empty(), "the card is drawn first");
+    assert_eq!(u.app.inspect()["pendingOpens"], 1);
+    u.frame(vec![]);
+    assert!(u.app.ui.pending_opens.is_empty());
+    assert_eq!(u.app.session.docs.len(), 1);
+    assert_eq!(u.app.session.docs[0].path.as_deref(), Some(path.to_string_lossy().as_ref()));
+    assert!(!u.app.ui.home, "and the editor shows it");
+    assert!(u.app.ui.toast.as_ref().is_none_or(|t| !t.0.starts_with("Drop a")), "no turning away");
+}
+
+#[test]
+fn dropping_an_unsupported_file_on_the_home_screen_opens_nothing() {
+    let dir = Temp::new();
+    let path = dir.path("unsupported.txt");
+    std::fs::write(&path, "not a design").unwrap();
+    let mut u = first_run();
+    u.app.ui.home = true;
+    drop_file(&mut u, &path);
+    assert!(u.app.session.docs.is_empty());
+    assert!(u.app.ui.home);
+    assert_eq!(u.app.ui.toast.as_ref().map(|t| t.0.as_str()), Some("Drop a .figcraft, .fig, .json, .svg or image file."));
+}
