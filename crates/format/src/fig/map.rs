@@ -31,6 +31,9 @@ pub(super) fn to_rest(msg: &Kv, name: &str) -> Result<(Value, Vec<String>), crat
     let mut m = Mapper::new(msg);
     let doc = m.document();
     let mut out = json!({"name": name, "document": doc});
+    if !m.library_contexts.is_empty() {
+        out[crate::rest::FIG_LIBRARY_CONTEXTS_FIELD] = Value::Array(std::mem::take(&mut m.library_contexts));
+    }
     if !m.styles.is_empty() {
         out["styles"] = Value::Object(std::mem::take(&mut m.styles));
     }
@@ -213,6 +216,10 @@ struct Mapper<'a> {
     /// Descriptions of components and component sets (REST `components` / `componentSets`).
     components: Obj,
     sets: Obj,
+    /// Component-bearing branches from private .fig internal canvases.
+    library_contexts: Vec<Value>,
+    library_scan_count: usize,
+    library_scan_limited: bool,
     override_scopes: BTreeMap<String, Rc<OverrideScope>>,
     override_scope_entries: usize,
     warnings: Vec<String>,
@@ -267,6 +274,9 @@ impl<'a> Mapper<'a> {
             styles: Obj::new(),
             components: Obj::new(),
             sets: Obj::new(),
+            library_contexts: Vec::new(),
+            library_scan_count: 0,
+            library_scan_limited: false,
             override_scopes: BTreeMap::new(),
             override_scope_entries: 0,
             warnings: Vec::new(),
@@ -354,6 +364,8 @@ impl<'a> Mapper<'a> {
             None => self.nodes.iter().filter(|(_, n)| n.get("type").and_then(Kv::str) == Some("CANVAS")).map(|(id, _)| id.clone()).collect(),
         };
         let mut out = Vec::new();
+        let mut internal = Vec::new();
+        let mut visible_pages = Vec::new();
         for p in pages {
             let Some(&n) = self.nodes.get(&p) else { continue };
             if n.get("type").and_then(Kv::str) != Some("CANVAS") {
@@ -362,14 +374,299 @@ impl<'a> Mapper<'a> {
             }
             // The hidden page that holds styles, variables and library copies.
             if n.get("internalOnly").and_then(Kv::bool) == Some(true) {
+                internal.push((p, n));
                 continue;
             }
+            visible_pages.push(p.clone());
             out.push(self.page(&p, n));
+        }
+        let required_mains = self.referenced_component_mains(&visible_pages);
+        for (id, canvas) in internal {
+            if let Some(context) = self.library_context(&id, canvas, &required_mains) {
+                self.library_contexts.push(context);
+            }
         }
         if out.is_empty() {
             self.warn("the file has no pages");
         }
         json!({"id": doc_id.unwrap_or_else(|| "0:0".into()), "type": "DOCUMENT", "children": out})
+    }
+
+    /// Keep only component definitions and the containers needed to preserve their source paths.
+    fn referenced_component_mains(&mut self, visible_pages: &[String]) -> BTreeSet<String> {
+        let mut mains = BTreeSet::new();
+        let mut pending = Vec::new();
+        for page in visible_pages {
+            for id in self.children(page) {
+                if pending.len() >= MAX_NODES {
+                    break;
+                }
+                pending.push((id, 1));
+            }
+            if pending.len() >= MAX_NODES {
+                break;
+            }
+        }
+        if pending.len() >= MAX_NODES {
+            self.warn(format!("visible component reference scan reached the {MAX_NODES}-layer limit"));
+        }
+        let mut visited = BTreeSet::new();
+        let mut reference_limited = false;
+        while let Some((id, depth)) = pending.pop() {
+            if depth > MAX_DEPTH {
+                self.warn(format!("component references below {MAX_DEPTH} visible-layer levels were skipped"));
+                continue;
+            }
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            if visited.len() > MAX_NODES {
+                self.warn(format!("visible component reference scan reached the {MAX_NODES}-layer limit"));
+                break;
+            }
+            let Some(node) = self.nodes.get(&id) else { continue };
+            let targets = self.component_main_targets(node);
+            self.add_component_targets(&mut mains, targets, &mut reference_limited);
+            let children = self.children(&id);
+            if pending.len().saturating_add(visited.len()).saturating_add(children.len()) > MAX_NODES {
+                if !reference_limited {
+                    self.warn(format!("visible component reference scan reached the {MAX_NODES}-layer limit"));
+                    reference_limited = true;
+                }
+                break;
+            }
+            pending.extend(children.into_iter().map(|child| (child, depth + 1)));
+        }
+
+        // Resolve nested mains only from definitions already reachable from visible instances.
+        let mut scanned_mains = BTreeSet::new();
+        let mut scanned_layers = visited;
+        let mut pending_mains: Vec<String> = mains.iter().cloned().collect();
+        'dependencies: while let Some(main) = pending_mains.pop() {
+            if !scanned_mains.insert(main.clone()) {
+                continue;
+            }
+            if scanned_mains.len() > MAX_NODES {
+                self.warn(format!("component dependency scan reached the {MAX_NODES}-main limit"));
+                break;
+            }
+            let mut layers = vec![(main.clone(), 0usize)];
+            let mut layer_seen = BTreeSet::new();
+            while let Some((id, depth)) = layers.pop() {
+                if depth > MAX_DEPTH {
+                    self.warn(format!("component dependencies deeper than {MAX_DEPTH} layers were skipped"));
+                    continue;
+                }
+                if !layer_seen.insert(id.clone()) {
+                    continue;
+                }
+                if !scanned_layers.insert(id.clone()) {
+                    continue;
+                }
+                if scanned_layers.len() > MAX_NODES {
+                    self.warn(format!("component dependency traversal reached the {MAX_NODES}-layer limit"));
+                    break 'dependencies;
+                }
+                let Some(node) = self.nodes.get(&id) else { continue };
+                let targets = self.component_main_targets(node);
+                let children = self.children(&id);
+                let dependencies = self.add_component_targets(&mut mains, targets, &mut reference_limited);
+                pending_mains.extend(dependencies);
+                if layers.len().saturating_add(scanned_layers.len()).saturating_add(children.len()) > MAX_NODES {
+                    self.warn(format!("component dependency traversal reached the {MAX_NODES}-layer limit"));
+                    break 'dependencies;
+                }
+                layers.extend(children.into_iter().map(|child| (child, depth + 1)));
+            }
+        }
+        mains
+    }
+
+    fn add_component_targets(&mut self, mains: &mut BTreeSet<String>, targets: Vec<String>, limited: &mut bool) -> Vec<String> {
+        let mut added = Vec::new();
+        for target in targets {
+            if mains.contains(&target) {
+                continue;
+            }
+            if mains.len() >= MAX_NODES {
+                if !*limited {
+                    self.warn(format!("component reference scan reached the {MAX_NODES}-main limit"));
+                    *limited = true;
+                }
+                break;
+            }
+            mains.insert(target.clone());
+            added.push(target);
+        }
+        added
+    }
+
+    fn instance_main_targets(&self, node: &Kv<'a>) -> Vec<String> {
+        if node.get("type").and_then(Kv::str) != Some("INSTANCE") {
+            return Vec::new();
+        }
+        let mut targets = Vec::new();
+        if let Some(main) = node.get("overriddenSymbolID").and_then(guid) {
+            targets.push(main);
+        }
+        if let Some(main) = node.get("symbolData").and_then(|data| data.get("symbolID")).and_then(guid) {
+            targets.push(main);
+        }
+        targets.extend(self.instance_swap_targets(node.get("componentPropAssignments").map(Kv::list).unwrap_or_default()));
+        let mut pending: Vec<(&Kv<'a>, usize)> = [
+            node.get("symbolData").and_then(|data| data.get("symbolOverrides")).map(Kv::list).unwrap_or_default(),
+            node.get("derivedSymbolData").map(Kv::list).unwrap_or_default(),
+        ]
+        .into_iter()
+        .flat_map(|rows| rows.iter().map(|row| (row, 1)))
+        .take(MAX_NODES)
+        .collect();
+        let mut visited = 0usize;
+        while let Some((row, depth)) = pending.pop() {
+            if depth > MAX_DEPTH || visited >= MAX_NODES {
+                break;
+            }
+            visited += 1;
+            if let Some(main) = row.get("overriddenSymbolID").and_then(guid) {
+                targets.push(main);
+            }
+            if let Some(main) = row.get("symbolData").and_then(|data| data.get("symbolID")).and_then(guid) {
+                targets.push(main);
+            }
+            targets.extend(self.instance_swap_targets(row.get("componentPropAssignments").map(Kv::list).unwrap_or_default()));
+            let nested: Vec<_> = [
+                row.get("symbolData").and_then(|data| data.get("symbolOverrides")).map(Kv::list).unwrap_or_default(),
+                row.get("derivedSymbolData").map(Kv::list).unwrap_or_default(),
+            ]
+            .into_iter()
+            .flat_map(|rows| rows.iter().map(|row| (row, depth + 1)))
+            .take(MAX_NODES.saturating_sub(pending.len()))
+            .collect();
+            pending.extend(nested);
+        }
+        targets
+    }
+
+    fn component_main_targets(&self, node: &Kv<'a>) -> Vec<String> {
+        let mut targets = self.instance_main_targets(node);
+        targets.extend(node.get("componentPropDefs").map(Kv::list).unwrap_or_default().iter().filter_map(|definition| {
+            let (_, "INSTANCE_SWAP") = definition.get("id").and_then(guid).and_then(|def| self.prop_defs.get(&def).cloned())? else {
+                return None;
+            };
+            definition.get("initialValue").and_then(|value| value.get("guidValue")).and_then(guid)
+        }));
+        targets
+    }
+
+    fn instance_swap_targets(&self, assignments: &[Kv<'a>]) -> Vec<String> {
+        assignments
+            .iter()
+            .filter_map(|assignment| {
+                let (_, "INSTANCE_SWAP") = assignment.get("defID").and_then(guid).and_then(|def| self.prop_defs.get(&def).cloned())? else {
+                    return None;
+                };
+                assignment.get("value").and_then(|value| value.get("guidValue")).and_then(guid)
+            })
+            .collect()
+    }
+
+    fn library_context(&mut self, id: &str, canvas: &'a Kv<'a>, required_mains: &BTreeSet<String>) -> Option<Value> {
+        if self.library_scan_count >= MAX_NODES {
+            if !self.library_scan_limited {
+                self.warn(format!("internal library traversal reached the {MAX_NODES}-layer limit; remaining branches were skipped"));
+                self.library_scan_limited = true;
+            }
+            return None;
+        }
+        let mut included = BTreeSet::new();
+        let mut parents = BTreeMap::from([(id.to_string(), None::<String>)]);
+        let mut pending: Vec<(String, usize, bool)> = self.children(id).into_iter().map(|child| (child, 1, false)).collect();
+        let mut visited = BTreeSet::new();
+        while let Some((node_id, depth, in_definition)) = pending.pop() {
+            if depth > MAX_DEPTH {
+                self.warn(format!("internal library branches deeper than {MAX_DEPTH} levels were skipped"));
+                continue;
+            }
+            if !visited.insert(node_id.clone()) {
+                let mut ancestry = BTreeSet::new();
+                let mut ancestor = Some(node_id.clone());
+                while let Some(parent) = ancestor {
+                    if !ancestry.insert(parent.clone()) {
+                        self.warn("cyclic parent links in internal library branches were truncated");
+                        break;
+                    }
+                    if ancestry.len() > MAX_DEPTH {
+                        break;
+                    }
+                    ancestor = parents.get(&parent).cloned().flatten();
+                }
+                continue;
+            }
+            self.library_scan_count += 1;
+            if self.library_scan_count > MAX_NODES {
+                if !self.library_scan_limited {
+                    self.warn(format!("internal library traversal reached the {MAX_NODES}-layer limit; remaining branches were skipped"));
+                    self.library_scan_limited = true;
+                }
+                break;
+            }
+            if visited.len() > MAX_NODES {
+                self.warn(format!("the file has more than {MAX_NODES} internal library layers; the rest were skipped"));
+                break;
+            }
+            let Some(node) = self.nodes.get(&node_id) else { continue };
+            let kind = node.get("type").and_then(Kv::str);
+            let definition = (kind == Some("SYMBOL") || (kind == Some("FRAME") && node.get("isStateGroup").and_then(Kv::bool) == Some(true)))
+                && required_mains.contains(&node_id);
+            let in_definition = in_definition || definition;
+            if in_definition {
+                included.insert(node_id.clone());
+            }
+            if definition {
+                let mut ancestor = parents.get(&node_id).cloned().flatten();
+                let mut ancestor_seen = BTreeSet::new();
+                let mut ancestor_depth = 0;
+                while let Some(parent) = ancestor {
+                    if !ancestor_seen.insert(parent.clone()) {
+                        self.warn("cyclic parent links in internal library branches were truncated");
+                        break;
+                    }
+                    if ancestor_depth >= MAX_DEPTH {
+                        self.warn(format!("internal library ancestry deeper than {MAX_DEPTH} levels was truncated"));
+                        break;
+                    }
+                    ancestor_depth += 1;
+                    included.insert(parent.clone());
+                    ancestor = parents.get(&parent).cloned().flatten();
+                }
+            }
+            for child in self.children(&node_id).into_iter().rev() {
+                parents.insert(child.clone(), Some(node_id.clone()));
+                pending.push((child, depth + 1, in_definition));
+            }
+        }
+        if included.is_empty() {
+            return None;
+        }
+
+        let mut context = Obj::new();
+        context.insert("id".into(), json!(id));
+        context.insert("type".into(), json!("FRAME"));
+        copy_str(&mut context, &View::of(canvas), "name", "name");
+        context.insert("size".into(), json!({"x": 0.0, "y": 0.0}));
+        context.insert("relativeTransform".into(), rows(Affine::IDENTITY));
+        context.insert(crate::rest::FIG_SOURCE_FIELD.into(), json!({"origin": id, "expanded": false, "wireFrame": true, "wireInstance": false}));
+        self.variable_bindings(&mut context, &View::of(canvas));
+        let mut children = Vec::new();
+        for child in self.children(id) {
+            if let Some(mapped) = self.layer_filtered(&child, None, Affine::IDENTITY, None, 0, Some(&included)) {
+                children.push(mapped);
+            }
+        }
+        if !children.is_empty() {
+            context.insert("children".into(), Value::Array(children));
+        }
+        Some(Value::Object(context))
     }
 
     fn page(&mut self, id: &str, n: &'a Kv<'a>) -> Value {
@@ -407,6 +704,21 @@ impl<'a> Mapper<'a> {
     /// parent's coordinates to the enclosing frame's (groups and booleans place their children in
     /// the frame's space, like the REST JSON). `parent`: the parent's view (grid tracks).
     fn layer(&mut self, id: &str, inst: Option<&Inst<'a>>, space: Affine, parent: Option<&View<'a>>, depth: usize) -> Option<Value> {
+        self.layer_filtered(id, inst, space, parent, depth, None)
+    }
+
+    fn layer_filtered(
+        &mut self,
+        id: &str,
+        inst: Option<&Inst<'a>>,
+        space: Affine,
+        parent: Option<&View<'a>>,
+        depth: usize,
+        included: Option<&BTreeSet<String>>,
+    ) -> Option<Value> {
+        if included.is_some_and(|ids| !ids.contains(id)) {
+            return None;
+        }
         if depth > MAX_DEPTH {
             self.warn(format!("layers nested deeper than {MAX_DEPTH} levels were skipped"));
             return None;
@@ -483,12 +795,13 @@ impl<'a> Mapper<'a> {
         if ty == "INSTANCE" {
             if let Some((sub, sym)) = self.instance(&mut o, &view, id, inst, &rest_id) {
                 for c in self.children(&sym) {
-                    kids.extend(self.layer(&c, Some(&sub), child_space, Some(&view), depth + 1));
+                    // The source branch can live outside this physical cache context.
+                    kids.extend(self.layer_filtered(&c, Some(&sub), child_space, Some(&view), depth + 1, None));
                 }
             }
         } else {
             for c in self.children(id) {
-                kids.extend(self.layer(&c, inst, child_space, Some(&view), depth + 1));
+                kids.extend(self.layer_filtered(&c, inst, child_space, Some(&view), depth + 1, included));
             }
         }
         if stand.is_some_and(|s| s.0 == "FRAME") {

@@ -1,7 +1,7 @@
 //! Synthetic .fig source identity: contextual overrides, main switches and invalid provenance.
 
 use figcraft_doc::color::PaintKind;
-use figcraft_doc::{Document, NodeId, NodeKind};
+use figcraft_doc::{Document, NodeId, NodeKind, PropDef};
 use serde_json::{Value, json};
 
 use super::kiwi::{Kv, Schema};
@@ -68,6 +68,472 @@ fn import_alias_message(message: Kv<'static>) -> Document {
     let (doc, warnings) = import(&bytes, "Alias.fig").unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
     doc
+}
+
+fn cached_component_message() -> Kv<'static> {
+    o(vec![(
+        "nodeChanges",
+        Kv::Array(vec![
+            node(1, None, "DOCUMENT", "Document", vec![]),
+            node(2, Some(1), "CANVAS", "Visible page", vec![]),
+            node(
+                3,
+                Some(1),
+                "CANVAS",
+                "Remote library",
+                vec![
+                    ("internalOnly", Kv::Bool(true)),
+                    (
+                        "variableModeBySetMap",
+                        o(vec![("entries", Kv::Array(vec![o(vec![("variableSetID", o(vec![("guid", g(30))])), ("variableModeID", g(52))])]))]),
+                    ),
+                ],
+            ),
+            node(
+                30,
+                Some(3),
+                "VARIABLE_SET",
+                "Remote theme",
+                vec![(
+                    "variableSetModes",
+                    Kv::Array(vec![
+                        o(vec![("id", g(51)), ("name", s("Light")), ("sortPosition", s("!"))]),
+                        o(vec![("id", g(52)), ("name", s("Dark")), ("sortPosition", s("\""))]),
+                    ]),
+                )],
+            ),
+            node(
+                9,
+                Some(3),
+                "FRAME",
+                "Cached component set",
+                vec![("isStateGroup", Kv::Bool(true)), ("size", o(vec![("x", Kv::Float(24.0)), ("y", Kv::Float(24.0))])), ("transform", matrix(0.0))],
+            ),
+            node(
+                10,
+                Some(9),
+                "SYMBOL",
+                "Cached remote icon",
+                vec![("size", o(vec![("x", Kv::Float(24.0)), ("y", Kv::Float(24.0))])), ("transform", matrix(0.0))],
+            ),
+            node(
+                11,
+                Some(10),
+                "ROUNDED_RECTANGLE",
+                "Cached path",
+                vec![("size", o(vec![("x", Kv::Float(24.0)), ("y", Kv::Float(24.0))])), ("transform", matrix(0.0))],
+            ),
+            node(
+                12,
+                Some(10),
+                "INSTANCE",
+                "Nested cached instance",
+                vec![
+                    ("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])),
+                    ("transform", matrix(0.0)),
+                    ("symbolData", symbol(22, vec![row(&[323], vec![("fillPaints", Kv::Array(vec![solid(0.2, 0.7, 0.1)]))])])),
+                ],
+            ),
+            node(
+                13,
+                Some(9),
+                "SYMBOL",
+                "Nested cached main",
+                vec![("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])), ("transform", matrix(0.0))],
+            ),
+            node(
+                14,
+                Some(13),
+                "ROUNDED_RECTANGLE",
+                "Nested cached path",
+                vec![("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])), ("transform", matrix(0.0))],
+            ),
+            node(
+                15,
+                Some(10),
+                "INSTANCE",
+                "Nested internal instance",
+                vec![
+                    ("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])),
+                    ("transform", matrix(0.0)),
+                    ("symbolData", symbol(13, vec![])),
+                ],
+            ),
+            node(
+                20,
+                Some(2),
+                "INSTANCE",
+                "Visible icon instance",
+                vec![
+                    ("size", o(vec![("x", Kv::Float(24.0)), ("y", Kv::Float(24.0))])),
+                    ("transform", matrix(0.0)),
+                    ("symbolData", symbol(10, vec![])),
+                ],
+            ),
+            node(
+                22,
+                Some(2),
+                "SYMBOL",
+                "Visible nested main",
+                vec![("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])), ("transform", matrix(0.0))],
+            ),
+            node(
+                23,
+                Some(22),
+                "ROUNDED_RECTANGLE",
+                "Visible nested path",
+                vec![("overrideKey", g(323)), ("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])), ("transform", matrix(0.0))],
+            ),
+        ]),
+    )])
+}
+
+fn cached_component_fixture() -> Vec<u8> {
+    let schema = alias_schema();
+    super::tests::canvas(&schema, &cached_component_message())
+}
+
+fn cached_component_override_fixture() -> Vec<u8> {
+    let mut message = cached_component_message();
+    let Kv::Object(fields) = &mut message else { panic!("cached component fixture has an unexpected wire shape") };
+    let changes = &mut fields.iter_mut().find(|(key, _)| *key == "nodeChanges").unwrap().1;
+    let Kv::Array(nodes) = changes else { panic!("cached component fixture has an unexpected wire shape") };
+    let instance = nodes.iter_mut().find(|node| node.get("name").and_then(Kv::str) == Some("Visible icon instance")).unwrap();
+    let Kv::Object(fields) = instance else { panic!("cached component fixture has an unexpected wire shape") };
+    fields.iter_mut().find(|(key, _)| *key == "symbolData").unwrap().1 =
+        symbol(10, vec![row(&[12], vec![("symbolData", symbol(22, vec![row(&[26], vec![("overriddenSymbolID", g(24))])]))])]);
+    nodes.extend([
+        node(
+            24,
+            Some(3),
+            "SYMBOL",
+            "Overridden cached main",
+            vec![("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])), ("transform", matrix(0.0))],
+        ),
+        node(
+            25,
+            Some(24),
+            "ROUNDED_RECTANGLE",
+            "Overridden cached path",
+            vec![("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])), ("transform", matrix(0.0))],
+        ),
+        node(
+            26,
+            Some(22),
+            "INSTANCE",
+            "Deep cached instance",
+            vec![("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])), ("transform", matrix(0.0)), ("symbolData", symbol(27, vec![]))],
+        ),
+        node(
+            27,
+            Some(3),
+            "SYMBOL",
+            "Base deep main",
+            vec![("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])), ("transform", matrix(0.0))],
+        ),
+        node(
+            28,
+            Some(27),
+            "ROUNDED_RECTANGLE",
+            "Base deep path",
+            vec![("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])), ("transform", matrix(0.0))],
+        ),
+    ]);
+    super::tests::canvas(&alias_schema(), &message)
+}
+
+fn cached_component_default_swap_fixture() -> Vec<u8> {
+    let mut message = cached_component_message();
+    let Kv::Object(fields) = &mut message else { panic!("cached component fixture has an unexpected wire shape") };
+    let changes = &mut fields.iter_mut().find(|(key, _)| *key == "nodeChanges").unwrap().1;
+    let Kv::Array(nodes) = changes else { panic!("cached component fixture has an unexpected wire shape") };
+    let owner = nodes.iter_mut().find(|node| node.get("name").and_then(Kv::str) == Some("Visible nested main")).unwrap();
+    let Kv::Object(fields) = owner else { panic!("cached component fixture has an unexpected wire shape") };
+    fields.push((
+        "componentPropDefs",
+        Kv::Array(vec![o(vec![
+            ("id", g(90)),
+            ("name", s("Icon")),
+            ("type", Kv::Enum("INSTANCE_SWAP")),
+            ("initialValue", o(vec![("guidValue", g(24))])),
+        ])]),
+    ));
+    nodes.extend([
+        node(
+            24,
+            Some(3),
+            "SYMBOL",
+            "Default cached main",
+            vec![("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])), ("transform", matrix(0.0))],
+        ),
+        node(
+            25,
+            Some(24),
+            "ROUNDED_RECTANGLE",
+            "Default cached path",
+            vec![("size", o(vec![("x", Kv::Float(12.0)), ("y", Kv::Float(12.0))])), ("transform", matrix(0.0))],
+        ),
+    ]);
+    super::tests::canvas(&alias_schema(), &message)
+}
+
+fn assert_default_swap(doc: &Document) {
+    let owner = named_node(doc, "Visible nested main");
+    let target = named_node(doc, "Default cached main");
+    let NodeKind::Component { props, .. } = &doc.node(owner).unwrap().kind else { panic!("visible component lost its property definition") };
+    assert_eq!(props.get("Icon"), Some(&PropDef::InstanceSwap { default: target, preferred: Vec::new() }), "{props:?}");
+    assert!(doc.is_remote(target));
+}
+
+fn named_node(doc: &Document, name: &str) -> NodeId {
+    doc.nodes().find(|node| node.name == name).unwrap().id
+}
+
+fn assert_dark_remote_mode(doc: &Document, node: NodeId) {
+    let collection = doc.variables.collections.iter().find(|collection| collection.name == "Remote theme").unwrap();
+    let dark = collection.modes.iter().find(|mode| mode.name == "Dark").unwrap();
+    assert_eq!(doc.modes_for(node).get(&collection.id), Some(&dark.id));
+}
+
+fn assert_no_linked_library_records(doc: &Document) {
+    assert!(doc.libraries.enabled.is_empty());
+    assert!(doc.libraries.components.is_empty());
+    assert!(doc.libraries.styles.is_empty());
+    assert!(doc.libraries.collections.is_empty());
+    assert!(doc.libraries.variables.is_empty());
+}
+
+#[test]
+fn hidden_cached_component_is_retained_linked_and_exported() {
+    let (doc, warnings) = import(&cached_component_fixture(), "Cached library.fig").unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(doc.pages.len(), 1, "hidden cache must not become a visible page");
+
+    let store = doc.library_store().expect("private .fig cache is retained");
+    let component = named_node(&doc, "Cached remote icon");
+    let path = doc.node(component).unwrap().children[0];
+    let set = doc.node(component).unwrap().parent.unwrap();
+    assert!(matches!(doc.node(set).unwrap().kind, NodeKind::ComponentSet { .. }));
+    let context = doc.node(set).unwrap().parent.unwrap();
+    assert_eq!(doc.node(context).unwrap().parent, Some(store));
+    assert!(doc.is_remote(component));
+    assert!(doc.is_remote(path));
+    assert_dark_remote_mode(&doc, component);
+    assert_no_linked_library_records(&doc);
+    assert_eq!(doc.node(path).unwrap().parent, Some(component));
+    assert!(matches!(doc.node(component).unwrap().kind, NodeKind::Component { .. }));
+    let instance = named_node(&doc, "Visible icon instance");
+    assert!(matches!(doc.node(instance).unwrap().kind, NodeKind::Instance { component: linked, .. } if linked == component));
+    let visible_path = doc.node(instance).unwrap().children[0];
+    assert_eq!(doc.node(visible_path).unwrap().source, Some(path));
+
+    let native = crate::save_bytes(&doc, None).unwrap();
+    let (native_back, native_warnings) = crate::load_bytes(&native).unwrap();
+    assert!(native_warnings.is_empty(), "{native_warnings:?}");
+    let native_component = named_node(&native_back, "Cached remote icon");
+    let native_path = native_back.node(native_component).unwrap().children[0];
+    assert!(native_back.is_remote(native_component) && native_back.is_remote(native_path));
+    assert_dark_remote_mode(&native_back, native_component);
+    assert_no_linked_library_records(&native_back);
+    let native_instance = named_node(&native_back, "Visible icon instance");
+    assert!(matches!(native_back.node(native_instance).unwrap().kind, NodeKind::Instance { component: linked, .. } if linked == native_component));
+    assert_eq!(native_back.node(native_back.node(native_instance).unwrap().children[0]).unwrap().source, Some(native_path));
+    let native_nested_instance = native_back
+        .node(native_component)
+        .unwrap()
+        .children
+        .iter()
+        .copied()
+        .find(|id| native_back.node(*id).is_some_and(|n| n.name == "Nested cached instance"))
+        .unwrap();
+    let native_external_main = named_node(&native_back, "Visible nested main");
+    assert!(
+        matches!(native_back.node(native_nested_instance).unwrap().kind, NodeKind::Instance { component: linked, .. } if linked == native_external_main)
+    );
+    let native_external_child = native_back.node(native_nested_instance).unwrap().children[0];
+    assert_eq!(native_back.node(native_external_child).unwrap().source, Some(native_back.node(native_external_main).unwrap().children[0]));
+    assert_eq!(fill_rgb_node(&native_back, native_external_child), Some([f64::from(0.2_f32), f64::from(0.7_f32), f64::from(0.1_f32)]));
+    let nested_main = named_node(&doc, "Nested cached main");
+    let nested_instance = named_node(&doc, "Nested internal instance");
+    assert!(doc.is_remote(nested_main));
+    assert!(matches!(doc.node(nested_instance).unwrap().kind, NodeKind::Instance { component: linked, .. } if linked == nested_main));
+    let external_main = named_node(&doc, "Visible nested main");
+    let external_instance =
+        doc.node(component).unwrap().children.iter().copied().find(|id| doc.node(*id).is_some_and(|n| n.name == "Nested cached instance")).unwrap();
+    assert!(matches!(doc.node(external_instance).unwrap().kind, NodeKind::Instance { component: linked, .. } if linked == external_main));
+    let external_child = doc.node(external_instance).unwrap().children[0];
+    assert_eq!(doc.node(external_child).unwrap().source, Some(doc.node(external_main).unwrap().children[0]));
+    assert_eq!(fill_rgb_node(&doc, external_child), Some([f64::from(0.2_f32), f64::from(0.7_f32), f64::from(0.1_f32)]));
+
+    let (bytes, export_warnings) = export(&doc, None).unwrap();
+    assert!(export_warnings.is_empty(), "{export_warnings:?}");
+    let (back, import_warnings) = import(&bytes, "Cached library roundtrip.fig").unwrap();
+    assert!(import_warnings.is_empty(), "{import_warnings:?}");
+    assert_eq!(back.pages.len(), 1);
+    let back_component = named_node(&back, "Cached remote icon");
+    let back_path = back.node(back_component).unwrap().children[0];
+    assert_eq!(back.node(back_path).unwrap().parent, Some(back_component));
+    assert!(back.is_remote(back_component) && back.is_remote(back_path));
+    assert_no_linked_library_records(&back);
+    assert_dark_remote_mode(&back, back_component);
+    let back_set = back.node(back_component).unwrap().parent.unwrap();
+    assert!(matches!(back.node(back_set).unwrap().kind, NodeKind::ComponentSet { .. }));
+    let back_instance = named_node(&back, "Visible icon instance");
+    assert!(matches!(back.node(back_instance).unwrap().kind, NodeKind::Instance { component: linked, .. } if linked == back_component));
+    let back_visible_path = back.node(back_instance).unwrap().children[0];
+    assert_eq!(back.node(back_visible_path).unwrap().source, Some(back_path));
+    let back_nested_main = named_node(&back, "Nested cached main");
+    let back_nested_instance = named_node(&back, "Nested internal instance");
+    assert!(matches!(back.node(back_nested_instance).unwrap().kind, NodeKind::Instance { component: linked, .. } if linked == back_nested_main));
+    let back_external_main = named_node(&back, "Visible nested main");
+    let back_external_instance = back
+        .node(back_component)
+        .unwrap()
+        .children
+        .iter()
+        .copied()
+        .find(|id| back.node(*id).is_some_and(|n| n.name == "Nested cached instance"))
+        .unwrap();
+    assert!(matches!(back.node(back_external_instance).unwrap().kind, NodeKind::Instance { component: linked, .. } if linked == back_external_main));
+    let back_external_child = back.node(back_external_instance).unwrap().children[0];
+    assert_eq!(back.node(back_external_child).unwrap().source, Some(back.node(back_external_main).unwrap().children[0]));
+    assert_eq!(fill_rgb_node(&back, back_external_child), Some([f64::from(0.2_f32), f64::from(0.7_f32), f64::from(0.1_f32)]));
+}
+
+#[test]
+fn visible_instance_override_retains_and_links_hidden_cached_main() {
+    let (doc, warnings) = import(&cached_component_override_fixture(), "Cached override.fig").unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let instance = named_node(&doc, "Visible icon instance");
+    let nested_instance = doc
+        .node(instance)
+        .unwrap()
+        .children
+        .iter()
+        .copied()
+        .find(|id| doc.node(*id).is_some_and(|node| node.name == "Nested cached instance"))
+        .unwrap();
+    let deep_instance = doc
+        .node(nested_instance)
+        .unwrap()
+        .children
+        .iter()
+        .copied()
+        .find(|id| doc.node(*id).is_some_and(|node| node.name == "Deep cached instance"))
+        .unwrap();
+    let NodeKind::Instance { component: overridden, .. } = doc.node(deep_instance).unwrap().kind else {
+        panic!("nested-row override lost its instance")
+    };
+    let overridden = doc.node(overridden).unwrap();
+    assert_eq!(overridden.name, "Overridden cached main");
+    assert!(doc.is_remote(overridden.id));
+    assert_eq!(doc.node(doc.node(deep_instance).unwrap().children[0]).unwrap().source, Some(overridden.children[0]));
+
+    let native = crate::save_bytes(&doc, None).unwrap();
+    let (native_back, native_warnings) = crate::load_bytes(&native).unwrap();
+    assert!(native_warnings.is_empty(), "{native_warnings:?}");
+    let native_instance = named_node(&native_back, "Visible icon instance");
+    let native_nested = native_back
+        .node(native_instance)
+        .unwrap()
+        .children
+        .iter()
+        .copied()
+        .find(|id| native_back.node(*id).is_some_and(|node| node.name == "Nested cached instance"))
+        .unwrap();
+    let native_deep = native_back
+        .node(native_nested)
+        .unwrap()
+        .children
+        .iter()
+        .copied()
+        .find(|id| native_back.node(*id).is_some_and(|node| node.name == "Deep cached instance"))
+        .unwrap();
+    let NodeKind::Instance { component: native_main, .. } = native_back.node(native_deep).unwrap().kind else {
+        panic!("native nested-row override lost its instance")
+    };
+    let native_main = native_back.node(native_main).unwrap();
+    assert_eq!(native_main.name, "Overridden cached main");
+    assert!(native_back.is_remote(native_main.id));
+    assert_eq!(native_back.node(native_back.node(native_deep).unwrap().children[0]).unwrap().source, Some(native_main.children[0]));
+
+    let (bytes, export_warnings) = export(&doc, None).unwrap();
+    assert!(export_warnings.is_empty(), "{export_warnings:?}");
+    let (back, import_warnings) = import(&bytes, "Cached override roundtrip.fig").unwrap();
+    assert!(import_warnings.is_empty(), "{import_warnings:?}");
+    let back_instance = named_node(&back, "Visible icon instance");
+    let back_nested = back
+        .node(back_instance)
+        .unwrap()
+        .children
+        .iter()
+        .copied()
+        .find(|id| back.node(*id).is_some_and(|node| node.name == "Nested cached instance"))
+        .unwrap();
+    let back_deep = back
+        .node(back_nested)
+        .unwrap()
+        .children
+        .iter()
+        .copied()
+        .find(|id| back.node(*id).is_some_and(|node| node.name == "Deep cached instance"))
+        .unwrap();
+    let NodeKind::Instance { component, .. } = back.node(back_deep).unwrap().kind else { panic!("round-trip nested-row override lost its instance") };
+    let main = back.node(component).unwrap();
+    assert_eq!(main.name, "Overridden cached main");
+    assert!(back.is_remote(main.id));
+    assert_eq!(back.node(back.node(back_deep).unwrap().children[0]).unwrap().source, Some(main.children[0]));
+}
+
+#[test]
+fn visible_component_default_swap_retains_hidden_cached_main() {
+    let (doc, warnings) = import(&cached_component_default_swap_fixture(), "Cached default swap.fig").unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_default_swap(&doc);
+
+    let native = crate::save_bytes(&doc, None).unwrap();
+    let (native_back, native_warnings) = crate::load_bytes(&native).unwrap();
+    assert!(native_warnings.is_empty(), "{native_warnings:?}");
+    assert_default_swap(&native_back);
+
+    let (bytes, export_warnings) = export(&doc, None).unwrap();
+    assert!(export_warnings.is_empty(), "{export_warnings:?}");
+    let (back, import_warnings) = import(&bytes, "Cached default swap roundtrip.fig").unwrap();
+    assert!(import_warnings.is_empty(), "{import_warnings:?}");
+    assert_default_swap(&back);
+}
+
+#[test]
+fn internal_library_parent_cycles_are_bounded() {
+    let schema = alias_schema();
+    let message = o(vec![(
+        "nodeChanges",
+        Kv::Array(vec![
+            node(1, None, "CANVAS", "Visible page", vec![]),
+            node(2, Some(1), "INSTANCE", "Visible cyclic main", vec![("symbolData", symbol(11, vec![]))]),
+            node(3, Some(9), "CANVAS", "Cyclic library", vec![("internalOnly", Kv::Bool(true))]),
+            node(9, Some(11), "FRAME", "Loop frame", vec![]),
+            node(10, Some(3), "SYMBOL", "Unrelated component", vec![]),
+            node(11, Some(3), "SYMBOL", "Loop component", vec![]),
+        ]),
+    )]);
+    let bytes = super::tests::canvas(&schema, &message);
+    let (_, warnings) = import(&bytes, "Cyclic library.fig").unwrap();
+    assert!(warnings.iter().any(|warning| warning.contains("cyclic parent links")), "{warnings:?}");
+}
+
+#[test]
+fn public_rest_import_ignores_private_fig_library_carrier() {
+    let value = json!({
+        "name": "Public REST",
+        "document": {"type": "DOCUMENT", "children": [{"type": "CANVAS", "name": "Page", "children": []}]},
+        "_figLibraryContexts": [{"type": "FRAME", "name": "Private cache", "children": [{"type": "COMPONENT", "name": "Must not import", "children": []}]}]
+    });
+    let (doc, warnings) = crate::rest::import(&value, &|_| None).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(doc.pages.len(), 1);
+    assert!(doc.library_store().is_none());
+    assert!(doc.nodes().all(|node| node.name != "Must not import"));
 }
 
 fn fill_rgb(doc: &Document, name: &str) -> Option<[f64; 3]> {

@@ -851,13 +851,38 @@ impl Session {
             ds.end_preview();
         }
         let before = self.ds().ok().map(|d| (d.doc.clone(), d.selection.clone(), d.page, d.uid));
-        let result = guard::run(id, || (spec.run)(self, params))
-            .and_then(|v| self.check_instance_structure(id, &before).map(|()| v))
+        let history_before = if matches!(id, "edit.undo" | "edit.redo") {
+            self.ds().ok().filter(|ds| !self.live_doc(ds.uid)).map(|ds| (ds.uid, ds.history.clone(), ds.revision))
+        } else {
+            None
+        };
+        let expected_history_doc = before
+            .as_ref()
+            .and_then(|(_, _, _, uid)| {
+                history_before.as_ref().and_then(|(history_uid, history, _)| {
+                    (*uid == *history_uid).then(|| match id {
+                        "edit.undo" => history.undo.last(),
+                        "edit.redo" => history.redo.last(),
+                        _ => None,
+                    })
+                })
+            })
+            .flatten()
+            .map(|entry| entry.doc.clone());
+        let run_result = guard::run(id, || (spec.run)(self, params));
+        let restored_history = run_result.is_ok()
+            && before.as_ref().is_some_and(|(_, _, _, uid)| {
+                expected_history_doc
+                    .as_ref()
+                    .is_some_and(|expected| self.docs.iter().find(|ds| ds.uid == *uid).is_some_and(|ds| Arc::ptr_eq(&ds.doc, expected)))
+            });
+        let result = run_result
+            .and_then(|v| self.check_instance_structure_with_history(id, &before, restored_history).map(|()| v))
             .and_then(|v| self.check_preview(id, &before).map(|()| v))
             .and_then(|v| self.check_live_access(id, &before).map(|()| v));
         match &result {
             Ok(_) => {
-                self.after_command(spec, before);
+                self.after_command(spec, before, restored_history);
                 // Imported bytes already live in the document. Keeping a Base64 copy for the
                 // journal or for "Repeat" would retain hundreds of megabytes after tabs are closed,
                 // and repeating would silently import the whole file again: byte imports are
@@ -883,6 +908,10 @@ impl Session {
                     ds.doc = doc;
                     ds.selection = sel;
                     ds.page = page;
+                    if let Some((_, history, revision)) = history_before.filter(|(history_uid, _, _)| *history_uid == uid) {
+                        ds.history = history;
+                        ds.revision = revision;
+                    }
                 }
             }
         }
@@ -913,9 +942,21 @@ impl Session {
     /// Instances can't gain, lose or reorder layers, nor move, resize or re-constrain the layers in
     /// them, and library copies are read-only: refuse such an edit (it is rolled back).
     fn check_instance_structure(&self, id: &str, before: &Option<(Arc<Document>, Vec<NodeId>, NodeId, u64)>) -> Result<()> {
+        self.check_instance_structure_with_history(id, before, false)
+    }
+
+    fn check_instance_structure_with_history(
+        &self,
+        id: &str,
+        before: &Option<(Arc<Document>, Vec<NodeId>, NodeId, u64)>,
+        restored_history: bool,
+    ) -> Result<()> {
         let Some((bdoc, _, _, uid)) = before else { return Ok(()) };
         let Some(ds) = self.docs.iter().find(|d| d.uid == *uid) else { return Ok(()) };
         if Arc::ptr_eq(&ds.doc, bdoc) {
+            return Ok(());
+        }
+        if restored_history {
             return Ok(());
         }
         // "Repeat" runs the repeated command.
@@ -930,7 +971,7 @@ impl Session {
     }
 
     /// Bookkeeping after a successful command: normalise what changed, push undo, bump revision.
-    fn after_command(&mut self, spec: &CommandSpec, before: Option<(Arc<Document>, Vec<NodeId>, NodeId, u64)>) {
+    fn after_command(&mut self, spec: &CommandSpec, before: Option<(Arc<Document>, Vec<NodeId>, NodeId, u64)>, restored_history: bool) {
         let Some((bdoc, bsel, bpage, uid)) = before else {
             if let Ok(ds) = self.ds_mut() {
                 ds.revision += 1;
@@ -939,7 +980,7 @@ impl Session {
         };
         let Some(ds) = self.docs.iter_mut().find(|d| d.uid == uid) else { return };
         let changed = !Arc::ptr_eq(&ds.doc, &bdoc);
-        if changed {
+        if changed && !restored_history {
             normalize(ds.doc_mut(), &bdoc);
         }
         let edit = changed && ds.interaction.is_none();

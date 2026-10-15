@@ -1147,7 +1147,11 @@ impl<'d> Exporter<'d> {
     /// flow starting points and overlay settings, before anything refers to them.
     fn assign(&mut self) {
         let doc = self.doc;
-        let mut stack: Vec<NodeId> = doc.pages.iter().rev().copied().collect();
+        let mut roots = doc.pages.clone();
+        if let Some(store) = doc.library_store() {
+            roots.extend(doc.node(store).into_iter().flat_map(|n| n.children.iter().copied()));
+        }
+        let mut stack: Vec<NodeId> = roots.into_iter().rev().collect();
         while let Some(id) = stack.pop() {
             let Some(n) = doc.node(id) else { continue };
             if self.ids.len() >= MAX_NODES {
@@ -1242,7 +1246,8 @@ impl<'d> Exporter<'d> {
     /// collections and the variables, each a node of its own.
     fn assets(&mut self, pages: usize) {
         let doc = self.doc;
-        if self.style_ids.is_empty() && self.set_ids.is_empty() && self.properties.catalogs.is_empty() {
+        let library_roots = doc.library_store().and_then(|id| doc.node(id)).map(|n| n.children.as_slice()).unwrap_or_default();
+        if self.style_ids.is_empty() && self.set_ids.is_empty() && self.properties.catalogs.is_empty() && library_roots.is_empty() {
             return;
         }
         let page = u32::try_from(self.ids.len() + 1).unwrap_or(u32::MAX);
@@ -1257,6 +1262,10 @@ impl<'d> Exporter<'d> {
         f.push(("internalOnly", b(true)));
         self.nodes.push(o(f));
         let mut index = 0usize;
+        for id in library_roots {
+            self.emit(*id, guid(LAYERS, page), index, None, 0);
+            index += 1;
+        }
         let mut head = |local: u32, ty: &'static str, name: &str| -> Fields {
             index += 1;
             vec![

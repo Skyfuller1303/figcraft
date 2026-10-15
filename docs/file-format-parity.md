@@ -1,6 +1,6 @@
 # File format parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-14 · **Change:** minor (bounded, source-sized .fig import decode budget and scoped component override-key aliases and initial bound paint-color settlement; M1 Figma import/export checks and robustness fixes; live desktop PAT and current-writer synthetic Figma checks; native Figma REST snapshots, byte/image imports and visible compatibility reports; SVG/PDF export depth refusal (#208); `.fig` export: instance sizes, variables with modes, shared styles, variable-width strokes; `.fig` export: written files checked by opening them in other software; experimental `.fig` export; export and inspect behaviour suite and fixes; .fig import: editable vector networks and more layer kinds; embedded image colour profiles; `.fig` import, best effort; animated GIF fills and TIFF images; last major: created, formats from the installed Figma's Info.plist and help center, ours from source) · **Target:** Figma Design (desktop app 126.10.7)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-15 · **Change:** minor (retained cached remote .fig main definitions and hidden-store export; bounded, source-sized .fig import decode budget and scoped component override-key aliases and initial bound paint-color settlement; M1 Figma import/export checks and robustness fixes; live desktop PAT and current-writer synthetic Figma checks; native Figma REST snapshots, byte/image imports and visible compatibility reports; SVG/PDF export depth refusal (#208); `.fig` export: instance sizes, variables with modes, shared styles, variable-width strokes; `.fig` export: written files checked by opening them in other software; experimental `.fig` export; export and inspect behaviour suite and fixes; .fig import: editable vector networks and more layer kinds; embedded image colour profiles; `.fig` import, best effort; animated GIF fills and TIFF images; last major: created, formats from the installed Figma's Info.plist and help center, ours from source) · **Target:** Figma Design (desktop app 126.10.7)
 
 Every format Figma reads or writes, with FigCraft's support. Sources: `Info.plist` of
 `/Applications/Figma.app` (document types only; nothing inside the bundle's code was read), Figma's
@@ -146,6 +146,12 @@ each.
   and retains contextual scalar values as its comparison baseline. Explicit local text decoration
   overrides a shared style's decoration. Focused synthetic cases cover identity, clears, rejected
   foreign/cyclic links and absolute child positioning. These fixes do not imply complete corpus fidelity.
+- **Cached remote mains (2026-10-15):** Referenced component branches of internal-only `.fig`
+  canvases are kept in the native hidden library store, including their ancestor contexts and
+  modes. Instances can retain their real main links without adding visible pages or inventing
+  a live library connection. Native saves retain the definitions; `.fig` export emits the hidden
+  component roots under its internal asset canvas. The private import carrier has no effect on
+  public REST imports. Missing mains retain the previous frame fallback.
 - **Hidden Boolean resources (2026-10-14):** Referenced hidden declarations retain each actual
   owner's Boolean default without adding one to a visible component. Export writes standard
   SYMBOL resources; private aliases preserve native names in FigCraft. An unregistered Boolean

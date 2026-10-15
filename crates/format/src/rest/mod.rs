@@ -64,6 +64,8 @@ const MAX_DEPTH: usize = 256;
 const MAX_JSON_NESTING: usize = 2 * MAX_DEPTH + 64;
 /// Private .fig provenance, consumed only by `import_fig`.
 pub(crate) const FIG_SOURCE_FIELD: &str = "_figSource";
+/// Hidden .fig library context; accepted only by [`import_fig`].
+pub(crate) const FIG_LIBRARY_CONTEXTS_FIELD: &str = "_figLibraryContexts";
 /// Longest SVG path string read from one geometry entry.
 const MAX_PATH_BYTES: usize = 4 << 20;
 /// Most path elements in one vector.
@@ -238,6 +240,12 @@ fn import_impl(v: &Value, variables: Option<&Value>, images: ImageResolver, fig_
                 cx.build(root, page, Space::default(), None, 0, true);
             }
             None => cx.warn("entries without a node type were skipped"),
+        }
+    }
+    if fig_sources {
+        for context in v.get(FIG_LIBRARY_CONTEXTS_FIELD).and_then(Value::as_array).into_iter().flatten() {
+            let store = cx.doc.ensure_library_store();
+            cx.build(context, store, Space::default(), None, 0, false);
         }
     }
     // Drop the empty page the new document started with once real pages exist.

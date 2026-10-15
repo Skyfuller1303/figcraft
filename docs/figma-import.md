@@ -159,6 +159,29 @@ external components and unresolved instance source links. This verifies the deco
 fix, not the visual misalignment reported in issue #329. The exporter retains its conservative
 256 MiB decoded-value admission budget.
 
+Referenced cached main components on an internal-only `.fig` canvas are retained as read-only offline
+library definitions in the native hidden library store. Their containing context keeps inherited
+variable modes and component-set ancestry; the cache does not add visible pages. Instance links,
+source identities and overrides are resolved against these retained definitions. The private
+carrier is consumed only by `.fig` import, not by public REST JSON import. Native saving retains
+the cache, and experimental `.fig` export writes it under the internal asset canvas. This does not
+create a live connection, update source or invented library identity. Truly unavailable mains
+still use the existing frame fallback and compatibility note. Pre-existing import dirty markers
+do not block unrelated visible edits: the library read-only guard checks whether a marked node
+actually changed, while retaining the dirty queue and protecting changed remote nodes. Local
+Undo/Redo recognizes only the exact recorded snapshot of the same document. Restoring that
+approved state keeps its pending dirty queue instead of treating historical instance geometry
+as a new override; preview and live-access checks remain active. A refused history command
+restores the local history and revision as well as the document state.
+
+A subsequent cached-main release check of the same private source retains 29 visible pages,
+106,293 nodes and four images. Its hidden store retains 1,514 component definitions and restores
+9,539 instance-to-main links without creating live library records. The external-component and
+source-link notes disappear; the remaining three notes concern segment strokes, region fills
+and grid tracks. Native CLI save/reopen retains the counts with no repair notes. Forty uniquely
+paired icon paint records agree with read-only Figma metadata. This is representative evidence,
+not exhaustive visual parity; the original source hash remains unchanged.
+
 Component overrides can address a materialized child by its original `overrideKey` rather than
 its current GUID. The importer resolves unique explicit aliases within the selected main,
 one instance boundary at a time, including swapped and nested instances. Current GUIDs take
