@@ -361,6 +361,155 @@ fn dropping_a_native_file_on_the_home_screen_opens_it() {
 }
 
 #[test]
+fn dropping_a_native_file_on_canvas_keeps_its_receiving_document_after_tab_switch() {
+    let dir = Temp::new();
+    let path = dir.path("Canvas import.figcraft");
+    let mut source = Session::new();
+    source.execute("file.saveAs", &json!({"path": path.to_string_lossy()})).unwrap();
+
+    let mut session = Session::new();
+    let target_uid = session.ds().unwrap().uid;
+    let target_page = session.page().unwrap();
+    let target_name = session.doc().unwrap().name.clone();
+    session.execute("file.new", &json!({"name": "Other tab"})).unwrap();
+    let other_uid = session.ds().unwrap().uid;
+    session.active = 0;
+    let mut u = Ui::new(session);
+    u.app.ui.home = false;
+    u.frame(vec![]);
+    let pos = u.app.canvas.rect.center();
+    let file: egui::DroppedFileHandle = std::sync::Arc::new(Dropped(path.clone()));
+    u.frame_raw(egui::RawInput { events: vec![Event::PointerMoved(pos)], dropped_files: vec![file], ..Default::default() });
+    let pending = u.app.ui.pending_opens.first().unwrap();
+    assert_eq!(pending.target.as_ref().map(|target| (target.uid, target.page)), Some((target_uid, target_page)));
+    assert_eq!(pending.target.as_ref().map(|target| target.name.as_str()), Some(target_name.as_str()));
+
+    u.frame(vec![]);
+    u.app.session.active = 1;
+    assert_eq!(u.app.session.ds().unwrap().uid, other_uid, "the UI switched tabs while the card was displayed");
+    assert_eq!(u.app.ui.pending_opens.len(), 1, "the switch happens before dispatch");
+    u.frame(vec![]);
+
+    assert_eq!(u.app.session.ds().unwrap().uid, other_uid, "the user's active tab stays in front");
+    assert_eq!(u.app.session.docs.iter().map(|doc| doc.doc.pages.len()).collect::<Vec<_>>(), [2, 1]);
+}
+
+#[test]
+fn canvas_import_uses_queued_page_and_restores_the_page_selected_while_waiting() {
+    let dir = Temp::new();
+    let path = dir.path("Queued.svg");
+    std::fs::write(&path, r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#f00"/></svg>"##)
+        .unwrap();
+
+    let mut session = Session::new();
+    let target_uid = session.ds().unwrap().uid;
+    let first_page = session.page().unwrap();
+    session.execute("page.add", &json!({"name": "Second page"})).unwrap();
+    let second_page = session.page().unwrap();
+    let second_page_shape = session.execute("node.create", &json!({"type": "rectangle", "x": 30, "y": 40, "width": 12, "height": 14})).unwrap()["id"]
+        .as_u64()
+        .map(figcraft_doc::NodeId)
+        .unwrap();
+    session.execute("page.select", &json!({"id": first_page})).unwrap();
+    session.execute("file.new", &json!({"name": "Other tab"})).unwrap();
+    let other_uid = session.ds().unwrap().uid;
+    session.active = 0;
+    let mut u = Ui::new(session);
+    u.app.ui.home = false;
+    u.frame(vec![]);
+    let pos = u.app.canvas.rect.center();
+    let file: egui::DroppedFileHandle = std::sync::Arc::new(Dropped(path));
+    u.frame_raw(egui::RawInput { events: vec![Event::PointerMoved(pos)], dropped_files: vec![file], ..Default::default() });
+    let queued_params = u.app.ui.pending_opens[0].params.clone();
+    assert_eq!(u.app.ui.pending_opens[0].target.as_ref().map(|target| (target.uid, target.page)), Some((target_uid, first_page)));
+
+    u.frame(vec![]);
+    u.app.session.execute("page.select", &json!({"id": second_page})).unwrap();
+    u.app.session.execute("select.set", &json!({"ids": [second_page_shape]})).unwrap();
+    u.app.session.active = 1;
+    u.frame(vec![]);
+    let target_index = u.app.session.docs.iter().position(|doc| doc.uid == target_uid).unwrap();
+    let imported = u.app.session.docs[target_index].doc.node(first_page).unwrap().children[0];
+    let doc = &u.app.session.docs[target_index].doc;
+    assert_eq!(doc.page_of(imported), Some(first_page));
+    let bounds = doc.world_bounds(imported).unwrap();
+    assert!((bounds.x0 - queued_params["x"].as_f64().unwrap()).abs() < 1.0);
+    assert!((bounds.y0 - queued_params["y"].as_f64().unwrap()).abs() < 1.0);
+    assert_eq!(doc.node(second_page).unwrap().children, [second_page_shape]);
+    assert_eq!(u.app.session.ds().unwrap().uid, other_uid);
+    assert_eq!(u.app.session.docs[target_index].page, second_page, "the page selected during the wait is restored");
+    assert_eq!(u.app.session.docs[target_index].selection, [second_page_shape], "the restored page keeps its selection");
+
+    u.app.session.active = target_index;
+    u.app.session.execute("edit.delete", &json!({})).unwrap();
+    let doc = &u.app.session.docs[target_index].doc;
+    assert!(doc.node(second_page).unwrap().children.is_empty(), "the next edit acts on the restored page selection");
+    assert_eq!(doc.node(first_page).unwrap().children.len(), 1, "the imported object on the queued page remains");
+}
+
+#[test]
+fn queued_canvas_import_is_cancelled_if_its_page_is_deleted() {
+    let dir = Temp::new();
+    let path = dir.path("Removed target.svg");
+    std::fs::write(&path, r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10"/></svg>"#).unwrap();
+
+    let mut session = Session::new();
+    let target_uid = session.ds().unwrap().uid;
+    session.execute("page.add", &json!({"name": "Keep this page"})).unwrap();
+    let target_page = session.page().unwrap();
+    session.execute("file.new", &json!({"name": "Other tab"})).unwrap();
+    let other_uid = session.ds().unwrap().uid;
+    session.active = 0;
+    let mut u = Ui::new(session);
+    u.app.ui.home = false;
+    u.frame(vec![]);
+    let pos = u.app.canvas.rect.center();
+    let file: egui::DroppedFileHandle = std::sync::Arc::new(Dropped(path));
+    u.frame_raw(egui::RawInput { events: vec![Event::PointerMoved(pos)], dropped_files: vec![file], ..Default::default() });
+    u.app.session.execute("page.delete", &json!({"id": target_page})).unwrap();
+    let other_before = u.app.session.docs.iter().find(|doc| doc.uid == other_uid).unwrap().doc.clone();
+    u.app.ui.pending_open_frames = 2;
+    crate::pending_open::pending_opens(&mut u.app, &u.ctx);
+    assert_eq!(u.app.session.docs.iter().find(|doc| doc.uid == other_uid).unwrap().doc, other_before);
+    let target = u.app.session.docs.iter().find(|doc| doc.uid == target_uid).unwrap();
+    assert_eq!(target.doc.pages.len(), 1);
+    assert!(!target.doc.nodes().any(|node| node.name == "Removed target"));
+    assert!(u.app.ui.last_error.as_deref().is_some_and(|error| error.contains("destination page was removed")));
+}
+
+#[test]
+fn queued_canvas_import_is_cancelled_if_its_document_is_closed() {
+    let dir = Temp::new();
+    let path = dir.path("Closed target.svg");
+    std::fs::write(&path, r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10"/></svg>"#).unwrap();
+
+    let mut session = Session::new();
+    let target_uid = session.ds().unwrap().uid;
+    session.execute("file.new", &json!({"name": "Other tab"})).unwrap();
+    let other_uid = session.ds().unwrap().uid;
+    session.active = 0;
+    let mut u = Ui::new(session);
+    u.app.ui.home = false;
+    u.frame(vec![]);
+    let pos = u.app.canvas.rect.center();
+    let file: egui::DroppedFileHandle = std::sync::Arc::new(Dropped(path));
+    u.frame_raw(egui::RawInput { events: vec![Event::PointerMoved(pos)], dropped_files: vec![file], ..Default::default() });
+    u.frame(vec![]);
+    let other_before = u.app.session.docs.iter().find(|doc| doc.uid == other_uid).unwrap().doc.clone();
+    let target_index = u.app.session.docs.iter().position(|doc| doc.uid == target_uid).unwrap();
+    u.app.session.docs.remove(target_index);
+    u.app.session.active = 0;
+
+    while !u.app.ui.pending_opens.is_empty() {
+        u.frame(vec![]);
+    }
+    assert_eq!(u.app.session.docs.len(), 1);
+    assert_eq!(u.app.session.ds().unwrap().uid, other_uid);
+    assert_eq!(u.app.session.doc().unwrap(), other_before.as_ref());
+    assert!(u.app.ui.last_error.as_deref().is_some_and(|error| error.contains("destination document was closed")));
+}
+
+#[test]
 fn dropping_an_unsupported_file_on_the_home_screen_opens_nothing() {
     let dir = Temp::new();
     let path = dir.path("unsupported.txt");

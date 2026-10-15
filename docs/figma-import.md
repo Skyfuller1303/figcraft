@@ -11,6 +11,11 @@ Choose **File → Open** or pass a `.fig` path when starting FigCraft to open a 
 document as one undo step. Opening an imported file does not use the source path as its save
 destination; choose a new `.figcraft` path when saving.
 
+A queued canvas drop stays bound to the document and page that received it, including the drop
+position, even if tabs or pages change while the import card is shown. If that destination is
+closed or removed, the import is cancelled instead of moving to another document. Home-screen
+drops still open a new document.
+
 An import report shows page, layer and image counts and compatibility notes. The CLI's
 `info file.fig --json` also returns notes. Missing local fonts can change the appearance of text;
 the fonts inside the source design are not downloaded or installed.

@@ -2,6 +2,7 @@
 //! Drafts" card: opening a large `.fig` blocks the UI thread for a while, and the card is on screen
 //! before it does (rather than a window that freezes without a word).
 
+use figcraft_doc::NodeId;
 use serde_json::Value;
 
 use crate::FigApp;
@@ -15,6 +16,58 @@ pub struct PendingOpen {
     pub label: String,
     pub params: Value,
     pub command: &'static str,
+    /// Canvas imports stay with the document and page that received the drop.
+    pub target: Option<ImportTarget>,
+}
+
+pub struct ImportTarget {
+    pub uid: u64,
+    pub page: NodeId,
+    pub name: String,
+}
+
+fn run_pending(app: &mut FigApp, pending: PendingOpen) -> Option<Value> {
+    let target = match pending.target {
+        Some(target) => target,
+        None if pending.command != "file.import" => return app.run(pending.command, pending.params),
+        None => {
+            cancel(app, "The destination document is unavailable. Nothing was imported.");
+            return None;
+        }
+    };
+    let Some(index) = app.session.docs.iter().position(|doc| doc.uid == target.uid) else {
+        cancel(app, "The destination document was closed. Nothing was imported.");
+        return None;
+    };
+    if !app.session.docs[index].doc.pages.contains(&target.page) {
+        cancel(app, "The destination page was removed. Nothing was imported.");
+        return None;
+    }
+
+    let previous = app.session.ds().ok().map(|doc| doc.uid);
+    let previous_page = app.session.docs[index].page;
+    let previous_selection = app.session.docs[index].selection.clone();
+    app.session.active = index;
+    app.session.docs[index].page = target.page;
+    let result = app.run(pending.command, pending.params);
+    if previous_page != target.page
+        && let Some(doc) = app.session.docs.iter_mut().find(|doc| doc.uid == target.uid)
+        && doc.doc.pages.contains(&previous_page)
+    {
+        doc.page = previous_page;
+        doc.selection = previous_selection;
+        doc.clean_selection();
+    }
+    if let Some(index) = previous.and_then(|uid| app.session.docs.iter().position(|doc| doc.uid == uid)) {
+        app.session.active = index;
+    }
+    result
+}
+
+fn cancel(app: &mut FigApp, message: &str) {
+    let message = tr(message).to_string();
+    app.ui.last_error = Some(message.clone());
+    app.toast(message);
 }
 
 /// Frames the card is drawn before the files open: egui lays a new card out invisibly on its first
@@ -32,7 +85,8 @@ pub fn pending_opens(app: &mut FigApp, ctx: &egui::Context) {
     if app.ui.pending_open_frames >= FRAMES_BEFORE_OPENING {
         app.ui.pending_open_frames = 0;
         for pending in std::mem::take(&mut app.ui.pending_opens) {
-            if app.run(pending.command, pending.params).is_some() && pending.command == "file.open" {
+            let command = pending.command;
+            if run_pending(app, pending).is_some() && command == "file.open" {
                 app.ui.home = false;
             }
         }
@@ -41,7 +95,13 @@ pub fn pending_opens(app: &mut FigApp, ctx: &egui::Context) {
     app.ui.pending_open_frames += 1;
     let title = match app.ui.pending_opens.first().map(|p| p.command) {
         Some("file.import") => {
-            let name = app.session.doc().map(|d| d.name.clone()).unwrap_or_default();
+            let name = app
+                .ui
+                .pending_opens
+                .first()
+                .and_then(|pending| pending.target.as_ref().map(|target| target.name.clone()))
+                .or_else(|| app.session.doc().ok().map(|d| d.name.clone()))
+                .unwrap_or_default();
             trf("Importing to {name}", &[("name", &name)])
         }
         _ => tr("Importing to Drafts").to_string(),

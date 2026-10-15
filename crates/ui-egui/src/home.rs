@@ -167,7 +167,7 @@ fn dropped(app: &mut FigApp, ctx: &egui::Context) {
         } else {
             continue;
         };
-        app.ui.pending_opens.push(crate::pending_open::PendingOpen { label: name, params, command: "file.open" });
+        app.ui.pending_opens.push(crate::pending_open::PendingOpen { label: name, params, command: "file.open", target: None });
     }
 }
 

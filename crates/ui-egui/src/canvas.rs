@@ -372,7 +372,12 @@ fn input(app: &mut FigApp, ui: &mut Ui, resp: &egui::Response) -> bool {
         } else {
             continue;
         };
-        app.ui.pending_opens.push(crate::pending_open::PendingOpen { label: name, params, command: "file.import" });
+        let Some(target) =
+            app.session.ds().ok().map(|doc| crate::pending_open::ImportTarget { uid: doc.uid, page: doc.page, name: doc.doc.name.clone() })
+        else {
+            continue;
+        };
+        app.ui.pending_opens.push(crate::pending_open::PendingOpen { label: name, params, command: "file.import", target: Some(target) });
     }
     let Some(pos) = hover_pos.filter(|p| app.canvas.rect.contains(*p)) else {
         // Leaving the canvas: nothing is hovered there any more.
