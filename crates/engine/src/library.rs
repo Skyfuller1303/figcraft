@@ -355,6 +355,11 @@ pub fn publish(doc: &Document, prev: Option<&PublishedLibrary>, sel: &Selection,
             snap.images.insert(h, img.clone());
         }
     }
+    for h in figcraft_doc::library::used_videos(&snap) {
+        if let Some(video) = doc.videos.get(&h) {
+            snap.videos.insert(h, video.clone());
+        }
+    }
     snap.take_dirty();
     // Versions: an asset or style keeps the version it last changed in.
     let version = prev.map_or(1, |p| p.manifest.version.saturating_add(1));
@@ -565,6 +570,20 @@ fn copy_images(doc: &mut Document, src: &Document, hashes: &BTreeSet<String>) {
     }
 }
 
+/// Copy the video sources referenced by the destination's newly imported nodes and styles.
+fn copy_videos(doc: &mut Document, src: &Document) {
+    if src.videos.is_empty() {
+        return;
+    }
+    for hash in figcraft_doc::library::used_videos(doc) {
+        if !doc.videos.contains_key(&hash)
+            && let Some(video) = src.videos.get(&hash)
+        {
+            doc.videos.insert(hash, video.clone());
+        }
+    }
+}
+
 /// The record of library `lid`'s `key` among `records` whose copy `exists`.
 fn record_of(records: &[ImportedRecord], lid: &str, key: &str, exists: impl Fn(&str) -> bool) -> Option<ImportedRecord> {
     records.iter().find(|r| r.library == lid && r.key == key && exists(&r.local)).cloned()
@@ -634,6 +653,7 @@ pub fn import_styles(doc: &mut Document, lib: &PublishedLibrary, keys: &BTreeSet
         }
     }
     copy_images(doc, &lib.doc, &hashes);
+    copy_videos(doc, &lib.doc);
     out
 }
 
@@ -860,6 +880,8 @@ pub fn import(doc: &mut Document, lib: &PublishedLibrary, keys: &[NodeId], updat
         doc.paste_nodes(&nodes, &map, *u, store, None)?;
     }
     copy_images(doc, src, &hashes);
+    copy_videos(doc, src);
+    figcraft_doc::library::validate_videos(&doc.videos).map_err(crate::EngineError::Other)?;
     for (u, sub) in &write {
         let Some(root) = map.get(u).copied() else { continue };
         let ids = sub.iter().filter_map(|i| map.get(i).map(|l| (*i, *l))).collect();
@@ -1158,6 +1180,10 @@ pub fn adopt_pasted(doc: &mut Document, src: &Document, src_path: Option<&str>, 
     }
     if !foreign.is_empty() {
         remote.extend(merge_components(doc, src, &BTreeMap::new(), Some(&foreign))?);
+        // Imported mains can reference assets outside the copied instance subtree.
+        copy_images(doc, src, &used_images(doc));
+        copy_videos(doc, src);
+        figcraft_doc::library::validate_videos(&doc.videos).map_err(EngineError::Other)?;
     }
     // Components `src` publishes: from its library.
     if let Some(lib) = src.published.as_ref().filter(|l| own.as_deref() != Some(l.manifest.id.as_str())) {
