@@ -108,24 +108,23 @@ pub fn pending_opens(app: &mut FigApp, ctx: &egui::Context) {
     };
     let t = Tokens::get(ctx);
     let pending = &app.ui.pending_opens;
+    let mut modal = crate::dialogs::modal(egui::Id::new("pending_open"), ctx);
     // Shown at once: the frame after this one may block the window while the file opens.
-    crate::dialogs::window("", ctx).id(egui::Id::new("pending_open")).title_bar(false).movable(false).interactable(false).fade_in(false).show(
-        ctx,
-        |ui| {
-            ui.set_width(480.0);
-            ui.label(egui::RichText::new(title).font(semibold(13.0)));
-            ui.add_space(12.0);
-            for p in pending {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(16.0));
-                    ui.label(p.label.as_str());
-                });
-            }
-            ui.add_space(16.0);
+    modal.area = modal.area.fade_in(false);
+    modal.show(ctx, |ui| {
+        ui.set_width(480.0);
+        ui.label(egui::RichText::new(title).font(semibold(13.0)));
+        ui.add_space(12.0);
+        for p in pending {
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(12.0));
-                ui.label(egui::RichText::new(tr("Opening the file…")).color(t.text_secondary));
+                ui.add(egui::Spinner::new().size(16.0));
+                ui.label(p.label.as_str());
             });
-        },
-    );
+        }
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(12.0));
+            ui.label(egui::RichText::new(tr("Opening the file…")).color(t.text_secondary));
+        });
+    });
 }
