@@ -515,3 +515,21 @@ fn dev_snapshots_count_as_users_of_videos_and_degrade_with_them() {
     let snap = d.dev_snapshots.values().next().unwrap();
     assert!(matches!(snap.nodes[0].fills[0].kind, PaintKind::Image(_)));
 }
+
+#[test]
+fn degrading_videos_leaves_layers_without_a_lost_video_clean() {
+    use figcraft_color::{ImageScaleMode, Paint, PaintKind};
+    let mut d = Document::new("x");
+    let page = d.pages[0];
+    let plain = d.alloc_id();
+    d.insert(Node::new(plain, NodeKind::Rectangle, "Plain", 10.0, 10.0), page, None).unwrap();
+    let clip = d.alloc_id();
+    let mut n = Node::new(clip, NodeKind::Rectangle, "Clip", 10.0, 10.0);
+    n.fills = vec![Paint::video("v".repeat(64), "poster", ImageScaleMode::Fill)];
+    d.insert(n, page, None).unwrap();
+    d.take_dirty();
+    assert_eq!(degrade_videos(&mut d, |_| false), 1);
+    assert!(matches!(d.node(clip).unwrap().fills[0].kind, PaintKind::Image(_)));
+    // Only the layer that lost its video changed; loading must not mark every layer edited.
+    assert_eq!(d.dirty().iter().copied().collect::<Vec<_>>(), vec![clip]);
+}

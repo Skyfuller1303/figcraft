@@ -408,6 +408,13 @@ pub fn degrade_videos(doc: &mut Document, keep: impl Fn(&str) -> bool) -> usize 
     }
     let ids: Vec<NodeId> = doc.ids().collect();
     for id in ids {
+        // `node_mut` marks the layer dirty: leave layers without a lost video untouched.
+        let Some(n) = doc.node(id) else { continue };
+        let mut videos = BTreeSet::new();
+        node_videos(n, &mut videos);
+        if videos.iter().all(|h| keep(h)) {
+            continue;
+        }
         let Some(n) = doc.node_mut(id) else { continue };
         changed += node(n, &keep);
     }
