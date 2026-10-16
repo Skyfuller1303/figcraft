@@ -403,6 +403,29 @@ pub struct ImagePaint {
 pub struct VideoPaint {
     pub video: String,
     pub poster: ImagePaint,
+    /// Per-paint playback settings. These defaults preserve FigCraft's existing native player
+    /// behavior; they do not claim Figma's defaults for omitted source fields.
+    #[serde(default)]
+    pub playback: VideoPlaybackOptions,
+}
+
+/// Playback options stored with a video paint.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct VideoPlaybackOptions {
+    /// Start playback when the video first appears in a presentation.
+    pub autoplay: bool,
+    /// Restart playback when it reaches the end (`loop` in serialized data).
+    #[serde(rename = "loop")]
+    pub looped: bool,
+    /// Start with audio muted.
+    pub muted: bool,
+}
+
+impl Default for VideoPlaybackOptions {
+    fn default() -> Self {
+        Self { autoplay: true, looped: false, muted: false }
+    }
 }
 
 impl ImagePaint {
@@ -589,7 +612,12 @@ impl Paint {
     /// Video source with a poster image and placement mode.
     pub fn video(video: impl Into<String>, poster: impl Into<String>, mode: ImageScaleMode) -> Self {
         let poster = ImagePaint { image: poster.into(), scale_mode: mode, scale: 1.0, rotation: 0, crop: None, filters: ImageFilters::default() };
-        Self { kind: PaintKind::Video(VideoPaint { video: video.into(), poster }), opacity: 1.0, visible: true, blend: BlendMode::Normal }
+        Self {
+            kind: PaintKind::Video(VideoPaint { video: video.into(), poster, playback: VideoPlaybackOptions::default() }),
+            opacity: 1.0,
+            visible: true,
+            blend: BlendMode::Normal,
+        }
     }
 
     /// Layer `source` (a node id) tiled at its own size.

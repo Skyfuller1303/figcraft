@@ -1,6 +1,4 @@
-//! Bounded native video decoding for FigCraft.
-//!
-//! First slice accepts silent, non-fragmented MP4 with progressive 8-bit 4:2:0 AVC Baseline.
+//! Bounded native MP4 decoding for progressive 8-bit 4:2:0 AVC Baseline/Main and AAC-LC.
 //! It rejects unsupported content rather than silently dropping streams or substituting frames.
 
 #![deny(unsafe_code)]
@@ -9,6 +7,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use filmcraft_aac::{AudioSpecificConfig, Decoder as AacDecoder};
 use filmcraft_bitstream::{length_prefixed_nals, unescape_rbsp};
 use filmcraft_h264::{
     Decoder, Picture,
@@ -18,12 +17,22 @@ use filmcraft_isobmff::{CodecConfig, TrackKind};
 
 /// Maximum accepted encoded source size.
 pub const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
-/// Maximum decoded width. Height limit is 720 pixels.
-pub const MAX_DIMENSION: u32 = 1280;
+/// Maximum visible width and coded width.
+pub const MAX_DIMENSION: u32 = 1920;
+/// Maximum visible frame height.
+pub const MAX_HEIGHT: u32 = 1080;
+/// Maximum coded frame height, including H.264 macroblock padding.
+pub const MAX_CODED_HEIGHT: u32 = 1088;
+/// Maximum coded frame pixels.
+pub const MAX_CODED_PIXELS: u64 = 1920 * 1088;
 /// Maximum clip duration.
 pub const MAX_DURATION_SECONDS: f64 = 60.0;
 /// Maximum video samples.
 pub const MAX_SAMPLES: usize = 1800;
+/// Maximum AAC access units per audio track.
+pub const MAX_AUDIO_ACCESS_UNITS: usize = 3000;
+/// Maximum total audio plus video sample entries accepted before demux.
+pub const MAX_TOTAL_SAMPLES: usize = MAX_SAMPLES + MAX_AUDIO_ACCESS_UNITS;
 /// Maximum nominal frame rate.
 pub const MAX_FRAME_RATE: f64 = 30.0;
 /// Maximum H.264 reference frames.
@@ -36,6 +45,11 @@ const MAX_MOOV_BYTES: usize = 2 * 1024 * 1024;
 const MAX_NALS_PER_SAMPLE: usize = 64;
 const MAX_DECODER_DPB_FRAMES: usize = 16;
 const MAX_REORDER_LOOKAHEAD: usize = MAX_DECODER_DPB_FRAMES;
+const MAX_AUDIO_RATE: u32 = 48_000;
+const MAX_AUDIO_CHANNELS: usize = 2;
+const MAX_AUDIO_PCM_BYTES: usize = 24 * 1024 * 1024;
+const AAC_SAMPLES_PER_ACCESS_UNIT: usize = 1024;
+const MAX_AUDIO_PRIMING_SAMPLES: usize = 2 * AAC_SAMPLES_PER_ACCESS_UNIT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum YuvMatrix {
@@ -85,6 +99,32 @@ pub struct VideoMetadata {
     pub duration_seconds: f64,
     pub frame_count: u32,
     pub frame_interval_seconds: f64,
+    pub audio: Option<AudioMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioMetadata {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub duration_seconds: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioClip {
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// Interleaved finite PCM beginning at presentation time zero.
+    pub samples: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AudioTimeline {
+    sample_rate: u32,
+    channels: u16,
+    leading_silence_samples: usize,
+    media_start_sample: usize,
+    media_sample_count: usize,
+    output_sample_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,7 +147,171 @@ pub fn validate_source(bytes: &[u8]) -> Result<(), VideoError> {
     Ok(())
 }
 
-/// Open one bounded silent AVC Baseline MP4 source.
+fn samples_from_ticks(ticks: u64, timescale: u32, sample_rate: u32) -> Result<usize, VideoError> {
+    if timescale == 0 {
+        return Err(VideoError::InvalidContainer);
+    }
+    let scaled = u128::from(ticks) * u128::from(sample_rate);
+    if scaled % u128::from(timescale) != 0 {
+        return Err(VideoError::Unsupported("audio timeline is not aligned to PCM samples"));
+    }
+    usize::try_from(scaled / u128::from(timescale)).map_err(|_| VideoError::InvalidContainer)
+}
+
+fn ticks_from_samples(samples: usize, timescale: u32, sample_rate: u32) -> Result<i64, VideoError> {
+    let scaled =
+        u128::try_from(samples).map_err(|_| VideoError::InvalidContainer)?.checked_mul(u128::from(timescale)).ok_or(VideoError::InvalidContainer)?;
+    if scaled % u128::from(sample_rate) != 0 {
+        return Err(VideoError::Unsupported("audio timeline is not aligned to media ticks"));
+    }
+    i64::try_from(scaled / u128::from(sample_rate)).map_err(|_| VideoError::InvalidContainer)
+}
+
+fn validate_audio_track(file: &filmcraft_isobmff::Mp4File, track: &filmcraft_isobmff::Track) -> Result<AudioTimeline, VideoError> {
+    if track.samples.is_empty() || track.samples.len() > MAX_AUDIO_ACCESS_UNITS {
+        return Err(VideoError::Unsupported("AAC access-unit count exceeds 3000"));
+    }
+    if track.duration == 0 || track.timescale == 0 {
+        return Err(VideoError::InvalidContainer);
+    }
+    let media_duration = track.duration as f64 / f64::from(track.timescale);
+    if !media_duration.is_finite() || media_duration > MAX_DURATION_SECONDS {
+        return Err(VideoError::Unsupported("audio duration exceeds 60 seconds"));
+    }
+    if track.entries.len() != 1 {
+        return Err(VideoError::Unsupported("AAC track must have one sample description"));
+    }
+    let entry = track.entries.first().ok_or(VideoError::InvalidContainer)?;
+    if entry.format.0 != *b"mp4a" {
+        return Err(VideoError::Unsupported("AAC mp4a audio required"));
+    }
+    let config = match &entry.codec {
+        CodecConfig::Aac(config) => config,
+        _ => return Err(VideoError::Unsupported("AAC-LC audio required")),
+    };
+    let asc = AudioSpecificConfig::parse(&config.asc).map_err(|e| {
+        VideoError::Unsupported(match e {
+            filmcraft_aac::Error::Unsupported(reason) => reason,
+            _ => "invalid AAC AudioSpecificConfig",
+        })
+    })?;
+    if asc.object_type != 2 || asc.sbr || asc.ps || asc.extension_sample_rate.is_some() || asc.pce.is_some() || asc.frame_length_flag {
+        return Err(VideoError::Unsupported("plain AAC-LC 1024-sample frames required"));
+    }
+    if !(1..=MAX_AUDIO_RATE).contains(&asc.sample_rate) || !matches!(asc.channel_config, 1 | 2) {
+        return Err(VideoError::Unsupported("AAC must be mono/stereo at up to 48 kHz"));
+    }
+    let channels = u16::try_from(asc.channels()).map_err(|_| VideoError::InvalidContainer)?;
+    let audio_params = entry.audio.as_ref().ok_or(VideoError::InvalidContainer)?;
+    if channels == 0
+        || usize::from(channels) > MAX_AUDIO_CHANNELS
+        || audio_params.channels != u32::from(channels)
+        || audio_params.sample_rate != f64::from(asc.sample_rate)
+    {
+        return Err(VideoError::Unsupported("AAC sample-entry and AudioSpecificConfig disagree"));
+    }
+    let first = track.samples.first().ok_or(VideoError::InvalidContainer)?;
+    let packet_duration_numerator =
+        u64::from(AAC_SAMPLES_PER_ACCESS_UNIT as u32).checked_mul(u64::from(track.timescale)).ok_or(VideoError::InvalidContainer)?;
+    if packet_duration_numerator % u64::from(asc.sample_rate) != 0 {
+        return Err(VideoError::Unsupported("AAC packet duration is not aligned to its media timescale"));
+    }
+    let packet_duration_ticks = i64::try_from(packet_duration_numerator / u64::from(asc.sample_rate)).map_err(|_| VideoError::InvalidContainer)?;
+    let mut decoded_duration = 0u64;
+    for (index, sample) in track.samples.iter().enumerate() {
+        let delta =
+            i64::try_from(index).map_err(|_| VideoError::InvalidContainer)?.checked_mul(packet_duration_ticks).ok_or(VideoError::InvalidContainer)?;
+        let expected_dts = first.dts.checked_add(delta).ok_or(VideoError::InvalidContainer)?;
+        let is_last = index + 1 == track.samples.len();
+        if sample.duration == 0
+            || sample.duration > packet_duration_ticks as u32
+            || (!is_last && sample.duration != packet_duration_ticks as u32)
+            || sample.dts != expected_dts
+            || sample.pts != sample.dts
+        {
+            return Err(VideoError::Unsupported("AAC access units must use a constant, non-reordered 1024-sample timeline"));
+        }
+        decoded_duration = decoded_duration.checked_add(u64::from(sample.duration)).ok_or(VideoError::InvalidContainer)?;
+    }
+    let decoded_samples = track.samples.len().checked_mul(AAC_SAMPLES_PER_ACCESS_UNIT).ok_or(VideoError::InvalidContainer)?;
+    let media_duration_samples = samples_from_ticks(track.duration, track.timescale, asc.sample_rate)?;
+    let decoded_duration_samples = samples_from_ticks(decoded_duration, track.timescale, asc.sample_rate)?;
+    if media_duration_samples > decoded_duration_samples
+        || decoded_duration_samples - media_duration_samples > 1
+        || media_duration_samples > decoded_samples
+        || decoded_samples - media_duration_samples > MAX_AUDIO_PRIMING_SAMPLES
+    {
+        return Err(VideoError::Unsupported("AAC media duration must match decoded access units within a one-sample tail"));
+    }
+
+    let (leading_silence_samples, media_start_sample, media_sample_count, output_sample_count) = if track.edits.is_empty() {
+        if track.edit_offset != 0 {
+            return Err(VideoError::Unsupported("unsupported AAC edit offset"));
+        }
+        (0, 0, media_duration_samples, media_duration_samples)
+    } else {
+        if track.edits.len() > 2 {
+            return Err(VideoError::Unsupported("AAC edit list exceeds bounded leading-empty plus media edit"));
+        }
+        let mut leading_silence = 0usize;
+        let mut media_edit = None;
+        let mut segment_total = 0u64;
+        for (index, edit) in track.edits.iter().enumerate() {
+            if edit.media_rate != 0x0001_0000 {
+                return Err(VideoError::Unsupported("AAC edit rate must be normal speed"));
+            }
+            segment_total = segment_total.checked_add(edit.segment_duration).ok_or(VideoError::InvalidContainer)?;
+            if edit.media_time == -1 && index == 0 {
+                leading_silence = samples_from_ticks(edit.segment_duration, file.timescale, asc.sample_rate)?;
+            } else if edit.media_time >= 0 && media_edit.is_none() {
+                media_edit = Some((samples_from_ticks(edit.media_time as u64, track.timescale, asc.sample_rate)?, edit.segment_duration));
+            } else {
+                return Err(VideoError::Unsupported("AAC edit list must have at most one leading empty edit and one media edit"));
+            }
+        }
+        if media_edit.is_none() && track.edits.len() != 1 {
+            return Err(VideoError::Unsupported("AAC edit list has no media segment"));
+        }
+        let duration_from_edits = samples_from_ticks(segment_total, file.timescale, asc.sample_rate)?;
+        let tkhd_samples = samples_from_ticks(track.tkhd_duration, file.timescale, asc.sample_rate)?;
+        if duration_from_edits != tkhd_samples {
+            return Err(VideoError::Unsupported("AAC edit duration and track header disagree"));
+        }
+        let (media_start, media_count) = match media_edit {
+            Some((start, duration)) => (start, samples_from_ticks(duration, file.timescale, asc.sample_rate)?),
+            None => (0, 0),
+        };
+        let media_end = media_start.checked_add(media_count).ok_or(VideoError::InvalidContainer)?;
+        let expected_offset = i64::try_from(leading_silence)
+            .map_err(|_| VideoError::InvalidContainer)?
+            .checked_mul(i64::from(track.timescale))
+            .ok_or(VideoError::InvalidContainer)?
+            .checked_div(i64::from(asc.sample_rate))
+            .ok_or(VideoError::InvalidContainer)?
+            .checked_sub(ticks_from_samples(media_start, track.timescale, asc.sample_rate)?)
+            .ok_or(VideoError::InvalidContainer)?;
+        if expected_offset != track.edit_offset || media_end > decoded_samples || media_start > MAX_AUDIO_PRIMING_SAMPLES {
+            return Err(VideoError::Unsupported("AAC edit trim or priming exceeds decoded timeline bounds"));
+        }
+        let output_samples = leading_silence.checked_add(media_count).ok_or(VideoError::InvalidContainer)?;
+        (leading_silence, media_start, media_count, output_samples)
+    };
+    if output_sample_count
+        > usize::try_from(asc.sample_rate)
+            .map_err(|_| VideoError::InvalidContainer)?
+            .checked_mul(MAX_DURATION_SECONDS as usize)
+            .ok_or(VideoError::InvalidContainer)?
+    {
+        return Err(VideoError::Unsupported("edited audio duration exceeds 60 seconds"));
+    }
+    let pcm_values = output_sample_count.checked_mul(usize::from(channels)).ok_or(VideoError::InvalidContainer)?;
+    if pcm_values.checked_mul(std::mem::size_of::<f32>()).is_none_or(|size| size > MAX_AUDIO_PCM_BYTES) {
+        return Err(VideoError::Unsupported("decoded audio exceeds 24 MiB PCM budget"));
+    }
+    Ok(AudioTimeline { sample_rate: asc.sample_rate, channels, leading_silence_samples, media_start_sample, media_sample_count, output_sample_count })
+}
+
+/// Open a bounded progressive AVC MP4 source with optional AAC-LC audio.
 ///
 /// FilmCraft's decoder DPB is limited to 16 frames; this adapter's separate output cache is limited
 /// to four RGBA frames. The SPS reference-frame limit remains four.
@@ -120,6 +324,10 @@ pub struct VideoSource {
     cache: VecDeque<VideoFrame>,
     metadata: VideoMetadata,
     color_override: Option<YuvColor>,
+    audio_track_index: Option<usize>,
+    audio_timeline: Option<AudioTimeline>,
+    #[cfg(test)]
+    converted_picture_indices: Vec<usize>,
 }
 
 impl VideoSource {
@@ -133,19 +341,47 @@ impl VideoSource {
         if file.fragmented || file.fragment_count != 0 {
             return Err(VideoError::Unsupported("fragmented MP4"));
         }
-        if file.tracks.len() != 1 || file.tracks.first().is_none_or(|t| t.kind != TrackKind::Video) {
-            return Err(VideoError::Unsupported("exactly one video track and no other tracks required"));
+        if file.tracks.is_empty() || file.tracks.len() > 2 {
+            return Err(VideoError::Unsupported("one video track and at most one AAC audio track required"));
         }
-        let track_index = 0;
-        let track = file.tracks.first().ok_or(VideoError::InvalidContainer)?;
+        let mut video_track_index = None;
+        let mut audio_track_index = None;
+        for (index, track) in file.tracks.iter().enumerate() {
+            match track.kind {
+                TrackKind::Video if video_track_index.replace(index).is_some() => {
+                    return Err(VideoError::Unsupported("multiple video tracks"));
+                }
+                TrackKind::Video => {}
+                TrackKind::Audio if audio_track_index.replace(index).is_some() => {
+                    return Err(VideoError::Unsupported("multiple audio tracks"));
+                }
+                TrackKind::Audio => {}
+                _ => return Err(VideoError::Unsupported("unsupported additional MP4 track")),
+            }
+        }
+        let track_index = video_track_index.ok_or(VideoError::InvalidContainer)?;
+        let track = file.tracks.get(track_index).ok_or(VideoError::InvalidContainer)?;
+        let (audio_timeline, audio_metadata) = match audio_track_index {
+            Some(index) => {
+                let audio_track = file.tracks.get(index).ok_or(VideoError::InvalidContainer)?;
+                let timeline = validate_audio_track(&file, audio_track)?;
+                let metadata = AudioMetadata {
+                    sample_rate: timeline.sample_rate,
+                    channels: timeline.channels,
+                    duration_seconds: timeline.output_sample_count as f64 / f64::from(timeline.sample_rate),
+                };
+                (Some(timeline), Some(metadata))
+            }
+            None => (None, None),
+        };
         if track.samples.is_empty() || track.samples.len() > MAX_SAMPLES {
             return Err(VideoError::Unsupported("sample count outside supported range"));
         }
         if track.timescale == 0 || track.duration == 0 {
             return Err(VideoError::InvalidContainer);
         }
-        let duration_seconds = track.duration as f64 / track.timescale as f64;
-        if !duration_seconds.is_finite() || duration_seconds <= 0.0 || duration_seconds > MAX_DURATION_SECONDS {
+        let video_duration_seconds = track.duration as f64 / track.timescale as f64;
+        if !video_duration_seconds.is_finite() || video_duration_seconds <= 0.0 || video_duration_seconds > MAX_DURATION_SECONDS {
             return Err(VideoError::Unsupported("duration exceeds 60 seconds"));
         }
         let entry = track.entries.first().ok_or(VideoError::InvalidContainer)?;
@@ -159,14 +395,15 @@ impl VideoSource {
         let sps_table = validate_avcc_parameters(&avcc)?;
         let mut dimensions = None;
         for sps in sps_table.iter().flatten() {
-            let dims = (sps.width(), sps.height());
+            let (_, _, width, height) = sps.crop_rect();
+            let dims = (width, height);
             if dimensions.replace(dims).is_some_and(|prev| prev != dims) {
                 return Err(VideoError::Unsupported("multiple SPS dimensions"));
             }
         }
         let (width, height) = dimensions.ok_or(VideoError::InvalidContainer)?;
-        if width > MAX_DIMENSION || height > 720 || width == 0 || height == 0 {
-            return Err(VideoError::Unsupported("dimensions exceed 1280x720 limit"));
+        if width > MAX_DIMENSION || height > MAX_HEIGHT || width == 0 || height == 0 {
+            return Err(VideoError::Unsupported("visible dimensions exceed 1920x1080 limit"));
         }
         let video_params = entry.video.as_ref().ok_or(VideoError::InvalidContainer)?;
         if u32::from(video_params.width) != width || u32::from(video_params.height) != height {
@@ -176,6 +413,15 @@ impl VideoSource {
         let sample_count = track.samples.len();
         let first_sample = track.samples.first().ok_or(VideoError::InvalidContainer)?;
         let sample_duration = first_sample.duration;
+        let covers = EditTimeline {
+            movie_timescale: file.timescale,
+            track_timescale: track.timescale,
+            track_duration: track.duration,
+            tolerance_ticks: u64::from(sample_duration),
+        };
+        if !video_edits_are_trivial(&track.edits, covers) {
+            return Err(VideoError::Unsupported("video edit lists that trim, delay or change speed"));
+        }
         if sample_duration == 0 {
             return Err(VideoError::InvalidContainer);
         }
@@ -190,7 +436,7 @@ impl VideoSource {
         }
         let interval_seconds = sample_duration as f64 / track.timescale as f64;
         let expected_duration = interval_seconds * sample_count as f64;
-        if (duration_seconds - expected_duration).abs() > interval_seconds {
+        if (video_duration_seconds - expected_duration).abs() > interval_seconds {
             return Err(VideoError::Unsupported("track duration does not match sample timeline"));
         }
         if interval_seconds <= 0.0 || 1.0 / interval_seconds > MAX_FRAME_RATE + 0.01 {
@@ -221,14 +467,87 @@ impl VideoSource {
             decoder,
             next_sample: 0,
             cache: VecDeque::new(),
-            metadata: VideoMetadata { width, height, duration_seconds, frame_count: sample_count as u32, frame_interval_seconds: interval_seconds },
+            metadata: VideoMetadata {
+                width,
+                height,
+                duration_seconds: audio_metadata.as_ref().map_or(video_duration_seconds, |audio| video_duration_seconds.max(audio.duration_seconds)),
+                frame_count: sample_count as u32,
+                frame_interval_seconds: interval_seconds,
+                audio: audio_metadata,
+            },
             color_override,
+            audio_track_index,
+            audio_timeline,
+            #[cfg(test)]
+            converted_picture_indices: Vec::new(),
         };
         Ok(source)
     }
 
     pub fn metadata(&self) -> &VideoMetadata {
         &self.metadata
+    }
+
+    /// Decode the optional AAC-LC track to interleaved presentation-timeline PCM.
+    ///
+    /// A cancelled or failed decode returns no partial clip. The callback is checked before each
+    /// encoded AAC access unit.
+    pub fn decode_audio_cancellable(&self, mut is_cancelled: impl FnMut() -> bool) -> Result<Option<AudioClip>, VideoError> {
+        let (Some(track_index), Some(timeline)) = (self.audio_track_index, self.audio_timeline) else {
+            return Ok(None);
+        };
+        let track = self.file.tracks.get(track_index).ok_or(VideoError::InvalidContainer)?;
+        let entry = track.entries.first().ok_or(VideoError::InvalidContainer)?;
+        let config = match &entry.codec {
+            CodecConfig::Aac(config) => config,
+            _ => return Err(VideoError::InvalidContainer),
+        };
+        let mut decoder = AacDecoder::new(&config.asc).map_err(|e| VideoError::Decode(e.to_string()))?;
+        let channels = usize::from(timeline.channels);
+        if decoder.sample_rate() != timeline.sample_rate || decoder.channels() != channels {
+            return Err(VideoError::Unsupported("AAC decoder metadata changed"));
+        }
+        let value_count = timeline.output_sample_count.checked_mul(channels).ok_or(VideoError::InvalidContainer)?;
+        if value_count.checked_mul(std::mem::size_of::<f32>()).is_none_or(|bytes| bytes > MAX_AUDIO_PCM_BYTES) {
+            return Err(VideoError::Unsupported("decoded audio exceeds 24 MiB PCM budget"));
+        }
+        let mut samples = vec![0.0f32; value_count];
+        if timeline.media_sample_count == 0 {
+            return Ok(Some(AudioClip { sample_rate: timeline.sample_rate, channels: timeline.channels, samples }));
+        }
+        let content_end = timeline.media_start_sample.checked_add(timeline.media_sample_count).ok_or(VideoError::InvalidContainer)?;
+        let packet_limit = content_end.div_ceil(AAC_SAMPLES_PER_ACCESS_UNIT).min(track.samples.len());
+        let mut written = 0usize;
+        for packet_index in 0..packet_limit {
+            if is_cancelled() {
+                return Err(VideoError::Cancelled);
+            }
+            let encoded = self.file.read_sample(self.bytes.as_slice(), track_index, packet_index).map_err(|_| VideoError::InvalidContainer)?;
+            let planes = decoder.decode(&encoded).map_err(|e| VideoError::Decode(e.to_string()))?;
+            if planes.len() != channels || planes.iter().any(|plane| plane.len() != AAC_SAMPLES_PER_ACCESS_UNIT) {
+                return Err(VideoError::Decode("AAC decoder returned an incomplete access unit".into()));
+            }
+            for local_index in 0..AAC_SAMPLES_PER_ACCESS_UNIT {
+                let source_index = packet_index * AAC_SAMPLES_PER_ACCESS_UNIT + local_index;
+                if source_index < timeline.media_start_sample || source_index >= content_end {
+                    continue;
+                }
+                let output_index = timeline.leading_silence_samples + source_index - timeline.media_start_sample;
+                for (channel, plane) in planes.iter().enumerate() {
+                    let sample = plane[local_index];
+                    if !sample.is_finite() {
+                        return Err(VideoError::Decode("AAC decoder returned non-finite PCM".into()));
+                    }
+                    let slot = output_index.checked_mul(channels).and_then(|v| v.checked_add(channel)).ok_or(VideoError::InvalidContainer)?;
+                    *samples.get_mut(slot).ok_or(VideoError::InvalidContainer)? = sample;
+                }
+                written += 1;
+            }
+        }
+        if written != timeline.media_sample_count {
+            return Err(VideoError::FrameUnavailable);
+        }
+        Ok(Some(AudioClip { sample_rate: timeline.sample_rate, channels: timeline.channels, samples }))
     }
 
     pub fn frame_at(&mut self, seconds: f64) -> Result<VideoFrame, VideoError> {
@@ -245,21 +564,44 @@ impl VideoSource {
         let boundary_roundoff = frame_position.abs().max(1.0) * f64::EPSILON * 4.0;
         let target = (frame_position + boundary_roundoff).floor() as usize;
         let target = target.min(last_frame);
-        if let Some(frame) = self.cache.iter().find(|frame| frame.frame_index as usize == target) {
-            return Ok(frame.clone());
+        self.frame_index_cancellable(target, target, &mut is_cancelled)?;
+        self.cache.iter().find(|frame| frame.frame_index as usize == target).cloned().ok_or(VideoError::FrameUnavailable)
+    }
+
+    /// Decode up to three frames after `anchor_frame`, keeping the anchor in the bounded cache.
+    pub fn prefetch_after_cancellable(&mut self, anchor_frame: u32, mut is_cancelled: impl FnMut() -> bool) -> Result<(), VideoError> {
+        let anchor = anchor_frame as usize;
+        let frame_count = self.metadata.frame_count as usize;
+        if anchor >= frame_count {
+            return Err(VideoError::FrameUnavailable);
         }
-        if target < self.next_sample || target.saturating_sub(self.next_sample) >= MAX_GOP_FRAMES {
-            self.reset_at_sync(target)?;
-        }
-        let lookahead_end = target.saturating_add(MAX_REORDER_LOOKAHEAD).min(last_frame);
-        let mut requested = None;
-        while self.next_sample <= lookahead_end && requested.is_none() {
+        let end = anchor.saturating_add(MAX_CACHED_FRAMES - 1).min(frame_count.saturating_sub(1));
+        for target in anchor.saturating_add(1)..=end {
             if is_cancelled() {
                 return Err(VideoError::Cancelled);
             }
-            requested = self.decode_one(self.next_sample, target)?;
+            self.frame_index_cancellable(target, anchor, &mut is_cancelled)?;
         }
-        requested.or_else(|| self.cache.iter().find(|frame| frame.frame_index as usize == target).cloned()).ok_or(VideoError::FrameUnavailable)
+        Ok(())
+    }
+
+    fn frame_index_cancellable(&mut self, target: usize, cache_anchor: usize, is_cancelled: &mut impl FnMut() -> bool) -> Result<(), VideoError> {
+        let cache_end = cache_anchor.saturating_add(MAX_CACHED_FRAMES - 1).min(self.metadata.frame_count.saturating_sub(1) as usize);
+        self.cache.retain(|frame| (cache_anchor..=cache_end).contains(&(frame.frame_index as usize)));
+        if self.cache.iter().any(|frame| frame.frame_index as usize == target) {
+            return Ok(());
+        }
+        if target < self.next_sample || target.saturating_sub(self.next_sample) >= MAX_GOP_FRAMES {
+            self.reset_at_sync(target, cache_anchor)?;
+        }
+        let lookahead_end = target.saturating_add(MAX_REORDER_LOOKAHEAD).min(self.metadata.frame_count.saturating_sub(1) as usize);
+        while self.next_sample <= lookahead_end && !self.cache.iter().any(|frame| frame.frame_index as usize == target) {
+            if is_cancelled() {
+                return Err(VideoError::Cancelled);
+            }
+            self.decode_one(self.next_sample, target, cache_anchor)?;
+        }
+        self.cache.iter().any(|frame| frame.frame_index as usize == target).then_some(()).ok_or(VideoError::FrameUnavailable)
     }
 }
 
@@ -367,8 +709,8 @@ fn scan_box_range(bytes: &[u8], start: usize, end: usize, depth: usize, state: &
 
 fn add_bounded_entries(total: &mut usize, count: usize) -> Result<(), VideoError> {
     *total = total.checked_add(count).ok_or(VideoError::InvalidContainer)?;
-    if *total > MAX_SAMPLES {
-        return Err(VideoError::Unsupported("aggregate sample table entries exceed 1800"));
+    if *total > MAX_TOTAL_SAMPLES {
+        return Err(VideoError::Unsupported("aggregate sample table entries exceed 4800"));
     }
     Ok(())
 }
@@ -381,8 +723,8 @@ fn check_sample_table(bytes: &[u8], span: BoxSpan, state: &mut PreflightState) -
         required(count_offset)?;
         let count =
             read_u32(bytes, payload.checked_add(count_offset - 4).ok_or(VideoError::InvalidContainer)?).ok_or(VideoError::InvalidContainer)? as usize;
-        if count > MAX_SAMPLES {
-            return Err(VideoError::Unsupported("sample table exceeds 1800 entries"));
+        if count > MAX_TOTAL_SAMPLES {
+            return Err(VideoError::Unsupported("sample table exceeds 4800 entries"));
         }
         let entries_offset = payload.checked_add(count_offset).ok_or(VideoError::InvalidContainer)?;
         let entry_bytes = count.checked_mul(width).ok_or(VideoError::InvalidContainer)?;
@@ -396,8 +738,8 @@ fn check_sample_table(bytes: &[u8], span: BoxSpan, state: &mut PreflightState) -
             required(12)?;
             let sample_size = read_u32(bytes, payload + 4).ok_or(VideoError::InvalidContainer)?;
             let count = read_u32(bytes, payload + 8).ok_or(VideoError::InvalidContainer)? as usize;
-            if count > MAX_SAMPLES {
-                return Err(VideoError::Unsupported("sample table exceeds 1800 entries"));
+            if count > MAX_TOTAL_SAMPLES {
+                return Err(VideoError::Unsupported("sample table exceeds 4800 entries"));
             }
             add_bounded_entries(&mut state.sample_entries, count)?;
             if sample_size == 0 && 12usize.checked_add(count.checked_mul(4).ok_or(VideoError::InvalidContainer)?).is_none_or(|need| need > len) {
@@ -408,8 +750,8 @@ fn check_sample_table(bytes: &[u8], span: BoxSpan, state: &mut PreflightState) -
             required(12)?;
             let field_size = *bytes.get(payload + 7).ok_or(VideoError::InvalidContainer)?;
             let count = read_u32(bytes, payload + 8).ok_or(VideoError::InvalidContainer)? as usize;
-            if count > MAX_SAMPLES {
-                return Err(VideoError::Unsupported("sample table exceeds 1800 entries"));
+            if count > MAX_TOTAL_SAMPLES {
+                return Err(VideoError::Unsupported("sample table exceeds 4800 entries"));
             }
             add_bounded_entries(&mut state.sample_entries, count)?;
             if !matches!(field_size, 4 | 8 | 16) {
@@ -448,8 +790,8 @@ fn check_sample_table(bytes: &[u8], span: BoxSpan, state: &mut PreflightState) -
             for i in 0..count {
                 let run = read_u32(bytes, entries + i * 8).ok_or(VideoError::InvalidContainer)?;
                 samples = samples.checked_add(u64::from(run)).ok_or(VideoError::InvalidContainer)?;
-                if samples > MAX_SAMPLES as u64 {
-                    return Err(VideoError::Unsupported("sample timing table exceeds 1800 samples"));
+                if samples > MAX_TOTAL_SAMPLES as u64 {
+                    return Err(VideoError::Unsupported("sample timing table exceeds 4800 samples"));
                 }
             }
         }
@@ -481,8 +823,8 @@ fn parse_sps(nal: &[u8]) -> Result<Sps, VideoError> {
 }
 
 fn check_sps(sps: &Sps) -> Result<(), VideoError> {
-    if sps.profile_idc != 66 {
-        return Err(VideoError::Unsupported("AVC Baseline profile required"));
+    if !matches!(sps.profile_idc, 66 | 77) {
+        return Err(VideoError::Unsupported("AVC Baseline or Main profile required"));
     }
     if sps.chroma_format_idc != 1 || sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 || sps.separate_colour_plane {
         return Err(VideoError::Unsupported("8-bit 4:2:0 required"));
@@ -493,8 +835,15 @@ fn check_sps(sps: &Sps) -> Result<(), VideoError> {
     if sps.max_dpb_frames() > MAX_DECODER_DPB_FRAMES || sps.max_num_reorder_frames() > MAX_REORDER_LOOKAHEAD {
         return Err(VideoError::Unsupported("decoder DPB and reorder delay must not exceed 16 frames"));
     }
-    if sps.width() > MAX_DIMENSION || sps.height() > 720 {
-        return Err(VideoError::Unsupported("SPS dimensions exceed 1280x720 limit"));
+    let (_, _, visible_width, visible_height) = sps.crop_rect();
+    let coded_pixels = u64::from(sps.width()) * u64::from(sps.height());
+    if sps.width() > MAX_DIMENSION
+        || sps.height() > MAX_CODED_HEIGHT
+        || coded_pixels > MAX_CODED_PIXELS
+        || visible_width > MAX_DIMENSION
+        || visible_height > MAX_HEIGHT
+    {
+        return Err(VideoError::Unsupported("SPS dimensions exceed bounded 1920x1088 coded limit"));
     }
     let vui = sps.vui.as_ref();
     validate_colorimetry(
@@ -564,11 +913,41 @@ fn validate_avcc_parameters(avcc: &filmcraft_isobmff::AvcConfig) -> Result<Vec<O
         }
         let rbsp = unescape_rbsp(nal.get(1..).ok_or(VideoError::InvalidContainer)?);
         let pps = Pps::parse(&rbsp, &sps_table).map_err(|e| VideoError::Decode(e.to_string()))?;
-        if pps.entropy_coding_mode || pps.num_slice_groups != 1 {
-            return Err(VideoError::Unsupported("AVC Baseline PPS with CAVLC and no FMO required"));
+        let sps = sps_table.get(pps.sps_id as usize).and_then(Option::as_ref).ok_or(VideoError::InvalidContainer)?;
+        if (sps.profile_idc == 66 && pps.entropy_coding_mode) || pps.num_slice_groups != 1 {
+            return Err(VideoError::Unsupported("AVC Baseline/Main PPS without FMO required"));
         }
     }
     Ok(sps_table)
+}
+
+/// Timescales and lengths a video edit has to cover.
+#[derive(Clone, Copy)]
+struct EditTimeline {
+    movie_timescale: u32,
+    track_timescale: u32,
+    track_duration: u64,
+    /// How much shorter than the media the edit may be (one frame), in track ticks.
+    tolerance_ticks: u64,
+}
+
+/// Video plays its samples from the start at normal speed, all of them: no edit list, or one edit
+/// that starts at media time 0 without changing the rate and lasts as long as the media (give or
+/// take a frame). (Audio honours its own edit list.)
+fn video_edits_are_trivial(edits: &[filmcraft_isobmff::Edit], t: EditTimeline) -> bool {
+    match edits {
+        [] => true,
+        [edit] => {
+            if edit.media_time != 0 || edit.media_rate != 0x0001_0000 || t.movie_timescale == 0 || t.track_timescale == 0 {
+                return false;
+            }
+            // Compare in movie ticks: segment >= media - tolerance.
+            let segment = u128::from(edit.segment_duration) * u128::from(t.track_timescale);
+            let media = u128::from(t.track_duration.saturating_sub(t.tolerance_ticks)) * u128::from(t.movie_timescale);
+            segment >= media
+        }
+        _ => false,
+    }
 }
 
 /// Samples must lie inside the source and not overlap, so the bytes read and parsed in total
@@ -641,8 +1020,9 @@ fn validate_all_samples(
                 8 => {
                     let rbsp = unescape_rbsp(nal.get(1..).ok_or(VideoError::InvalidContainer)?);
                     let pps = Pps::parse(&rbsp, sps_table).map_err(|e| VideoError::Decode(e.to_string()))?;
-                    if pps.entropy_coding_mode || pps.num_slice_groups != 1 {
-                        return Err(VideoError::Unsupported("AVC Baseline PPS with CAVLC and no FMO required"));
+                    let sps = sps_table.get(pps.sps_id as usize).and_then(Option::as_ref).ok_or(VideoError::InvalidContainer)?;
+                    if (sps.profile_idc == 66 && pps.entropy_coding_mode) || pps.num_slice_groups != 1 {
+                        return Err(VideoError::Unsupported("AVC Baseline/Main PPS without FMO required"));
                     }
                     if !avcc.pps.iter().any(|configured| configured.as_slice() == nal) {
                         return Err(VideoError::Unsupported("in-band PPS change"));
@@ -671,7 +1051,7 @@ impl VideoSource {
         Ok(decoder)
     }
 
-    fn reset_at_sync(&mut self, target: usize) -> Result<(), VideoError> {
+    fn reset_at_sync(&mut self, target: usize, cache_anchor: usize) -> Result<(), VideoError> {
         let track = self.file.tracks.get(self.track_index).ok_or(VideoError::InvalidContainer)?;
         let sync = track.sync_sample_before(target);
         if target.saturating_sub(sync) >= MAX_GOP_FRAMES {
@@ -679,31 +1059,32 @@ impl VideoSource {
         }
         self.decoder = self.make_decoder()?;
         self.next_sample = sync;
-        self.cache.clear();
+        let cache_end = cache_anchor.saturating_add(MAX_CACHED_FRAMES - 1).min(self.metadata.frame_count.saturating_sub(1) as usize);
+        self.cache.retain(|frame| (cache_anchor..=cache_end).contains(&(frame.frame_index as usize)));
         Ok(())
     }
 
-    fn decode_one(&mut self, index: usize, requested_index: usize) -> Result<Option<VideoFrame>, VideoError> {
+    fn decode_one(&mut self, index: usize, requested_index: usize, cache_anchor: usize) -> Result<(), VideoError> {
         self.file.tracks.get(self.track_index).and_then(|t| t.samples.get(index)).ok_or(VideoError::FrameUnavailable)?;
         let data = self.file.read_sample(self.bytes.as_slice(), self.track_index, index).map_err(|_| VideoError::InvalidContainer)?;
         let pictures = self.decoder.decode(&data, index as i64).map_err(|e| VideoError::Decode(e.to_string()))?;
         if let Some(error) = self.decoder.take_error() {
             return Err(VideoError::Decode(error.to_string()));
         }
-        let mut requested = self.accept_pictures(pictures, requested_index)?;
+        self.accept_pictures(pictures, requested_index, cache_anchor)?;
         self.next_sample = index + 1;
         if self.next_sample == self.file.tracks.get(self.track_index).map_or(0, |t| t.samples.len()) {
             let pictures = self.decoder.flush();
             if let Some(error) = self.decoder.take_error() {
                 return Err(VideoError::Decode(error.to_string()));
             }
-            requested = self.accept_pictures(pictures, requested_index)?.or(requested);
+            self.accept_pictures(pictures, requested_index, cache_anchor)?;
         }
-        Ok(requested)
+        Ok(())
     }
 
-    fn accept_pictures(&mut self, pictures: Vec<Picture>, requested_index: usize) -> Result<Option<VideoFrame>, VideoError> {
-        let mut requested = None;
+    fn accept_pictures(&mut self, pictures: Vec<Picture>, requested_index: usize, cache_anchor: usize) -> Result<(), VideoError> {
+        let cache_end = cache_anchor.saturating_add(MAX_CACHED_FRAMES - 1).min(self.metadata.frame_count.saturating_sub(1) as usize);
         for picture in pictures {
             if picture.width != self.metadata.width || picture.height != self.metadata.height {
                 return Err(VideoError::Unsupported("decoded dimensions changed"));
@@ -712,21 +1093,48 @@ impl VideoSource {
             if index >= self.metadata.frame_count as usize {
                 return Err(VideoError::InvalidContainer);
             }
-            let frame = to_rgba(picture, index, self.metadata.frame_interval_seconds, self.color_override)?;
-            if index == requested_index {
-                requested = Some(frame.clone());
+            validate_colorimetry(
+                u16::from(picture.color.primaries),
+                u16::from(picture.color.transfer),
+                u16::from(picture.color.matrix),
+                picture.color.full_range,
+            )?;
+            validate_picture_planes(&picture)?;
+            if index < requested_index || !(cache_anchor..=cache_end).contains(&index) {
+                continue;
             }
+            #[cfg(test)]
+            self.converted_picture_indices.push(index);
+            let frame = to_rgba(picture, index, self.metadata.frame_interval_seconds, self.color_override)?;
             if let Some(existing) = self.cache.iter_mut().find(|f| f.frame_index as usize == index) {
                 *existing = frame;
             } else {
                 self.cache.push_back(frame);
             }
-            while self.cache.len() > MAX_CACHED_FRAMES {
-                self.cache.pop_front();
-            }
         }
-        Ok(requested)
+        Ok(())
     }
+}
+
+fn validate_picture_planes(picture: &Picture) -> Result<(), VideoError> {
+    let width = usize::try_from(picture.width).map_err(|_| VideoError::InvalidContainer)?;
+    let height = usize::try_from(picture.height).map_err(|_| VideoError::InvalidContainer)?;
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
+    let last_index = |plane_width: usize, plane_height: usize, stride: usize| {
+        plane_height
+            .checked_sub(1)
+            .and_then(|row| row.checked_mul(stride))
+            .and_then(|offset| offset.checked_add(plane_width.checked_sub(1)?))
+            .ok_or(VideoError::InvalidContainer)
+    };
+    if picture.y.get(last_index(width, height, picture.y_stride)?).is_none()
+        || picture.u.get(last_index(uv_width, uv_height, picture.uv_stride)?).is_none()
+        || picture.v.get(last_index(uv_width, uv_height, picture.uv_stride)?).is_none()
+    {
+        return Err(VideoError::InvalidContainer);
+    }
+    Ok(())
 }
 
 fn to_rgba(picture: Picture, index: usize, interval: f64, override_color: Option<YuvColor>) -> Result<VideoFrame, VideoError> {
@@ -741,29 +1149,39 @@ fn to_rgba(picture: Picture, index: usize, interval: f64, override_color: Option
     let height = usize::try_from(picture.height).map_err(|_| VideoError::InvalidContainer)?;
     let pixels = width.checked_mul(height).ok_or(VideoError::InvalidContainer)?;
     let bytes = pixels.checked_mul(4).ok_or(VideoError::InvalidContainer)?;
-    let mut rgba = Vec::with_capacity(bytes);
+    validate_picture_planes(&picture)?;
+    let (r_v, g_u, g_v, b_u, y_offset) = match (color.matrix, color.full_range) {
+        (YuvMatrix::Bt601, false) => (409, 100, 208, 516, 16),
+        (YuvMatrix::Bt709, false) => (459, 55, 136, 541, 16),
+        (YuvMatrix::Bt601, true) => (359, 88, 183, 454, 0),
+        (YuvMatrix::Bt709, true) => (403, 48, 120, 475, 0),
+    };
+    let y_scale = if color.full_range { 256 } else { 298 };
+    let chroma_width = width.div_ceil(2);
+    let mut rgba = vec![0; bytes];
     for y in 0..height {
-        for x in 0..width {
-            let yv = picture
-                .y
-                .get(y.checked_mul(picture.y_stride).and_then(|v| v.checked_add(x)).ok_or(VideoError::InvalidContainer)?)
-                .copied()
-                .ok_or(VideoError::InvalidContainer)? as i32;
-            let uv_index = (y / 2).checked_mul(picture.uv_stride).and_then(|v| v.checked_add(x / 2)).ok_or(VideoError::InvalidContainer)?;
-            let u = picture.u.get(uv_index).copied().ok_or(VideoError::InvalidContainer)? as i32 - 128;
-            let v = picture.v.get(uv_index).copied().ok_or(VideoError::InvalidContainer)? as i32 - 128;
-            let (r_v, g_u, g_v, b_u, y_offset) = match (color.matrix, color.full_range) {
-                (YuvMatrix::Bt601, false) => (409, 100, 208, 516, 16),
-                (YuvMatrix::Bt709, false) => (459, 55, 136, 541, 16),
-                (YuvMatrix::Bt601, true) => (359, 88, 183, 454, 0),
-                (YuvMatrix::Bt709, true) => (403, 48, 120, 475, 0),
-            };
-            let y_scale = if color.full_range { 256 } else { 298 };
+        let y_start = y.checked_mul(picture.y_stride).ok_or(VideoError::InvalidContainer)?;
+        let y_row = picture.y.get(y_start..y_start.checked_add(width).ok_or(VideoError::InvalidContainer)?).ok_or(VideoError::InvalidContainer)?;
+        let uv_start = (y / 2).checked_mul(picture.uv_stride).ok_or(VideoError::InvalidContainer)?;
+        let u_row =
+            picture.u.get(uv_start..uv_start.checked_add(chroma_width).ok_or(VideoError::InvalidContainer)?).ok_or(VideoError::InvalidContainer)?;
+        let v_row =
+            picture.v.get(uv_start..uv_start.checked_add(chroma_width).ok_or(VideoError::InvalidContainer)?).ok_or(VideoError::InvalidContainer)?;
+        let rgba_start = y.checked_mul(width).and_then(|row| row.checked_mul(4)).ok_or(VideoError::InvalidContainer)?;
+        let rgba_row_end = rgba_start.checked_add(width.checked_mul(4).ok_or(VideoError::InvalidContainer)?).ok_or(VideoError::InvalidContainer)?;
+        let rgba_row = rgba.get_mut(rgba_start..rgba_row_end).ok_or(VideoError::InvalidContainer)?;
+        let chroma_pairs = u_row.iter().zip(v_row).flat_map(|(&u, &v)| std::iter::repeat_n((u, v), 2));
+        for ((yv, (u, v)), pixel) in y_row.iter().zip(chroma_pairs).zip(rgba_row.chunks_exact_mut(4)) {
+            let yv = *yv as i32;
+            let u = u as i32 - 128;
+            let v = v as i32 - 128;
             let c = (yv - y_offset).max(0);
-            rgba.push(((y_scale * c + r_v * v + 128) >> 8).clamp(0, 255) as u8);
-            rgba.push(((y_scale * c - g_u * u - g_v * v + 128) >> 8).clamp(0, 255) as u8);
-            rgba.push(((y_scale * c + b_u * u + 128) >> 8).clamp(0, 255) as u8);
-            rgba.push(255);
+            pixel.copy_from_slice(&[
+                ((y_scale * c + r_v * v + 128) >> 8).clamp(0, 255) as u8,
+                ((y_scale * c - g_u * u - g_v * v + 128) >> 8).clamp(0, 255) as u8,
+                ((y_scale * c + b_u * u + 128) >> 8).clamp(0, 255) as u8,
+                255,
+            ]);
         }
     }
     Ok(VideoFrame {

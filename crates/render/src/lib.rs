@@ -20,12 +20,16 @@ pub mod paint;
 pub mod pattern;
 pub mod retained;
 pub mod shadow;
+pub mod video;
 
-pub use draw::VideoFrames;
 pub use draw::{node_outline, paint_bounds, stroke_fill, subtree_outline, ts_path};
 pub use export_depth::{ExportDepthError, MAX_EXPORT_DEPTH, check_export_depth};
 pub use retained::{Retained, Work};
 pub use tiny_skia::{FillRule, Pixmap};
+pub use video::{
+    PaintDomain, PaintId, VideoFrames, VideoInstanceId, VideoOccurrenceId, VideoPaintOccurrence, VideoPatternPath, VideoRenderContext,
+    VideoScanBudget, VideoScanReport, VideoScopeId, visit_paint_batches, visit_video_occurrences,
+};
 
 use figcraft_color::{Color, ColorProfile};
 use figcraft_doc::{Document, ExportFormat, NodeId, NodeKind};
@@ -182,6 +186,7 @@ pub fn render_view_single(doc: &Document, page: NodeId, view: &View, opts: &Opti
         under: None,
         time: 0.0,
         video_frames: None,
+        video_context: None,
     };
     let xf = view.transform();
     let Some(p) = doc.node(page) else { return Some(pix) };
@@ -198,11 +203,19 @@ pub fn render_view_single(doc: &Document, page: NodeId, view: &View, opts: &Opti
 
 /// Render several nodes (in z-order) into an existing pixmap through `view`.
 pub fn render_nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut Pixmap) {
-    nodes_into(doc, ids, view, pix, 0.0, None);
+    nodes_into(doc, ids, view, pix, 0.0, None, None);
 }
 
 /// [`render_nodes_into`] `time` seconds into animated GIFs.
-fn nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut Pixmap, time: f64, video_frames: Option<&VideoFrames>) {
+fn nodes_into(
+    doc: &Document,
+    ids: &[NodeId],
+    view: &View,
+    pix: &mut Pixmap,
+    time: f64,
+    video_frames: Option<&VideoFrames>,
+    video_scope: Option<VideoScopeId>,
+) {
     let ctx = draw::Ctx {
         doc,
         scale: view.scale,
@@ -214,6 +227,7 @@ fn nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut Pixmap, tim
         under: None,
         time,
         video_frames,
+        video_context: video_scope.map(|scope| VideoRenderContext { scope, patterns: VideoPatternPath::default() }),
     };
     for id in ids {
         draw::draw_node(&ctx, pix, *id, view.transform() * parent_transform(doc, *id), 0);
@@ -280,21 +294,29 @@ pub fn render_node(doc: &Document, id: NodeId, scale: f64) -> Option<Pixmap> {
 
 /// [`render_node`] `time` seconds into animated GIFs (the presenter plays them).
 pub fn render_node_at(doc: &Document, id: NodeId, scale: f64, time: f64) -> Option<Pixmap> {
-    area_at(doc, &[id], export_bounds(doc, id)?, scale, time, None)
+    area_at(doc, &[id], export_bounds(doc, id)?, scale, time, None, None)
 }
 
-/// Rasterise one node with explicit decoded video frames; absent hashes use their static posters.
-pub fn render_node_with_video_frames(doc: &Document, id: NodeId, scale: f64, time: f64, frames: &VideoFrames) -> Option<Pixmap> {
-    area_at(doc, &[id], export_bounds(doc, id)?, scale, time, Some(frames))
+/// Rasterise one node with frames selected by the presentation scope and paint occurrence.
+pub fn render_node_with_video_frames(doc: &Document, id: NodeId, scale: f64, time: f64, scope: VideoScopeId, frames: &VideoFrames) -> Option<Pixmap> {
+    area_at(doc, &[id], export_bounds(doc, id)?, scale, time, Some(frames), Some(scope))
 }
 
 /// Rasterise `ids` (bottom to top) over page area `b` at `scale` (export): the image starts at the
 /// area's top-left and its sides round up to whole pixels. `None` past 16384 pixels a side.
 pub fn render_area(doc: &Document, ids: &[NodeId], b: Rect, scale: f64) -> Option<Pixmap> {
-    area_at(doc, ids, b, scale, 0.0, None)
+    area_at(doc, ids, b, scale, 0.0, None, None)
 }
 
-fn area_at(doc: &Document, ids: &[NodeId], b: Rect, scale: f64, time: f64, video_frames: Option<&VideoFrames>) -> Option<Pixmap> {
+fn area_at(
+    doc: &Document,
+    ids: &[NodeId],
+    b: Rect,
+    scale: f64,
+    time: f64,
+    video_frames: Option<&VideoFrames>,
+    video_scope: Option<VideoScopeId>,
+) -> Option<Pixmap> {
     let scale = if scale.is_finite() && scale > 0.0 { scale.min(64.0) } else { 1.0 };
     let w = (b.width() * scale - 1e-6).ceil().max(1.0);
     let h = (b.height() * scale - 1e-6).ceil().max(1.0);
@@ -303,7 +325,7 @@ fn area_at(doc: &Document, ids: &[NodeId], b: Rect, scale: f64, time: f64, video
     }
     let view = View { origin: (b.x0, b.y0), scale, width: w as u32, height: h as u32 };
     let mut pix = new_pixmap(view.width, view.height)?;
-    nodes_into(doc, ids, &view, &mut pix, time, video_frames);
+    nodes_into(doc, ids, &view, &mut pix, time, video_frames, video_scope);
     Some(pix)
 }
 

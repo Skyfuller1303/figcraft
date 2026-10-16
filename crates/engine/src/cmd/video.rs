@@ -21,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "video.place",
             "Place video",
-            "{path | data (base64), name?, x?, y?, width?, height?, parent?, center?} → {id, video, poster, width, height, duration}. Silent Baseline H.264 MP4 only; at most 16 MiB, 1280×720 and 60 seconds.",
+            "{path | data (base64), name?, x?, y?, width?, height?, parent?, center?} → {id, video, poster, width, height, duration, hasAudio}. Baseline/Main H.264 MP4 with optional AAC-LC mono/stereo audio; at most 16 MiB, 1920×1080 and 60 seconds.",
             true,
             place
         ),
@@ -113,7 +113,9 @@ pub fn place(s: &mut Session, p: &Value) -> Result<Value> {
     node.fills = vec![Paint::video(hash.clone(), poster.clone(), ImageScaleMode::Fill)];
     doc.insert(node, parent, None)?;
     s.set_selection(vec![nid]);
-    Ok(json!({"id": nid, "video": hash, "poster": poster, "width": width, "height": height, "duration": info.duration_seconds}))
+    Ok(
+        json!({"id": nid, "video": hash, "poster": poster, "width": width, "height": height, "duration": info.duration_seconds, "hasAudio": info.audio.is_some()}),
+    )
 }
 
 #[cfg(target_arch = "wasm32")]

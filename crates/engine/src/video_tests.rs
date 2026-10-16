@@ -1,4 +1,4 @@
-//! Synthetic silent-video placement and its existing document workflows.
+//! Synthetic video placement and its existing document workflows.
 
 #![allow(clippy::unwrap_used, clippy::panic)]
 
@@ -56,12 +56,9 @@ fn video_rejection_leaves_assets_selection_and_history_unchanged() {
     let before = s.ds().unwrap().doc.clone();
     let selection = s.selection().to_vec();
     let undo = s.ds().unwrap().history.undo.len();
-    for params in [
-        json!({"data": data(AUDIO)}),
-        json!({"data": data(b"not an MP4")}),
-        json!({"data": data(SILENT), "parent": 999999999}),
-        json!({"data": data(SILENT), "width": -1}),
-    ] {
+    for params in
+        [json!({"data": data(b"not an MP4")}), json!({"data": data(SILENT), "parent": 999999999}), json!({"data": data(SILENT), "width": -1})]
+    {
         assert!(s.execute("video.place", &params).is_err());
         assert!(Arc::ptr_eq(&before, &s.ds().unwrap().doc));
         assert_eq!(s.selection(), selection);
@@ -143,6 +140,27 @@ fn video_native_save_and_append_preserve_playable_source() {
     dest.execute("file.import", &json!({"name": "clip.figcraft", "data": data(&bytes)})).unwrap();
     assert_eq!(dest.doc().unwrap().videos[key].bytes.as_slice(), SILENT);
     assert!(dest.doc().unwrap().images.contains_key(r["poster"].as_str().unwrap()));
+}
+
+#[test]
+fn aac_video_import_preserves_playable_audio_through_copy_and_save() {
+    let mut source = Session::new();
+    let result = source.execute("file.import", &json!({"name": "clip.mp4", "data": data(AUDIO)})).unwrap();
+    assert_eq!(result["hasAudio"], true);
+    let key = result["video"].as_str().unwrap();
+    assert_eq!(source.selection(), vec![id_of(&result["id"]).unwrap()]);
+    source.execute("edit.copy", &json!({})).unwrap();
+    source.execute("file.new", &json!({})).unwrap();
+    source.execute("edit.paste", &json!({})).unwrap();
+    let saved = figcraft_format::save_bytes(source.doc().unwrap(), None).unwrap();
+    let (loaded, issues) = figcraft_format::load_bytes(&saved).unwrap();
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(loaded.videos[key].bytes.as_slice(), AUDIO, "preserve the original AAC-bearing MP4");
+    let mut decoded = figcraft_media::VideoSource::open(loaded.videos[key].bytes.clone()).unwrap();
+    assert!(decoded.frame_at(0.5).is_ok());
+    let audio = decoded.decode_audio_cancellable(|| false).unwrap().unwrap();
+    assert_eq!(audio.sample_rate, 48_000);
+    assert!(audio.samples.iter().any(|sample| sample.abs() > 0.01));
 }
 
 #[test]

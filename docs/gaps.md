@@ -258,12 +258,12 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
 ### 12. Video fills; HEIC images
 - **Landed (2026-10-11):** animated GIF fills (the file kept as is, the first frame on the canvas
   and in exports, played in the presenter and the preview) and TIFF images.
-- **Landed (2026-10-15, bounded native subset):** silent AVC Baseline MP4 video fills with a
+- **Landed (2026-10-15, bounded native subset):** AVC Baseline/Main MP4 video fills with optional AAC-LC audio and a
   content-addressed source and static poster; editing and native persistence; poster rendering in
-  the editor and PNG/SVG/PDF exports; prototype play, pause, resume and restart. Native files keep
+  the editor and PNG/SVG/PDF exports; synchronized native audio/video play, pause, resume and restart. Native files keep
   source and poster through save/load, versions, branches, clipboard and local libraries. Model/archive
   regression tests cover native-file preservation; a separate browser WASM build completed.
-- **Missing:** HEIC; broader MP4 profiles and containers, MOV and WebM; audio; Figma video import
+- **Missing:** HEIC; broader MP4 profiles and containers, MOV and WebM; broader audio formats; Figma video import
   from `.fig`; and real-file compatibility checks. The accepted native MP4 profile and limits are
   documented in [`native-video.md`](native-video.md). Figma media actions remain in gap 15.
 - **Validation:** native desktop control checks with generated synthetic inputs passed, including
@@ -313,11 +313,15 @@ No alpha blockers: the alpha gate in [`roadmap.md`](roadmap.md#alpha-gate) passe
   presented prototype, on the prototype's own copy; `proto.evaluate` computes expressions (mode
   lookups included) where a layer's interaction would run (`crates/engine/src/proto_tail_tests.rs`,
   `crates/ui-egui/src/present_tail_tests.rs`, `crates/format/src/rest/gamepad_tests.rs`).
-- **Missing:** video triggers (on media hit/end) and play/pause/mute/seek actions (the REST
-  importer warns and skips them, `crates/format/src/rest/proto.rs`); controllers on macOS, Linux
+- **Implemented and locally validated (2026-10-16):** native video timestamp/end triggers, nine
+  playback/mute/seek actions, and per-video Autoplay, Loop and Sound controls. The REST importer
+  maps documented media fields. Independent playback occurrences and audio voices are bounded;
+  see [`native-video.md`](native-video.md) for scope, edge conventions and validation status.
+- **Missing:** verified binary `.fig` media import, navigation/Smart Animate video-position
+  preservation and browser playback; controllers on macOS, Linux
   and FreeBSD (the usual Rust controller library links libudev on Linux; a pure-Rust reader per
   platform, or an owner decision on that dependency); PlayStation and Switch button labels.
-- **Estimate:** 2–5 h; media triggers and actions remain separate from the native video fill in gap 12.
+- **Estimate:** remaining scope needs re-estimation for binary media import, navigation preservation and broader runtime support.
 
 ### 16. Dev Mode: the tail after dev resources
 - **Landed (2026-10-11):** code connect: a component or set links to its code component per

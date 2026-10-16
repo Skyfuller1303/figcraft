@@ -2055,6 +2055,10 @@ impl<'d> Exporter<'d> {
     fn interaction(&mut self, it: &Interaction) -> Option<Kv<'static>> {
         let mut event: Fields = Vec::new();
         let ty = match &it.trigger {
+            Trigger::OnMediaHit { .. } | Trigger::OnMediaEnd => {
+                self.warn("video prototype triggers were left out; binary FIG media events are not supported");
+                return None;
+            }
             Trigger::OnClick => "ON_CLICK",
             Trigger::OnHover => "ON_HOVER",
             Trigger::OnPress => "ON_PRESS",
@@ -2123,6 +2127,10 @@ impl<'d> Exporter<'d> {
             Action::Back => plain("BACK"),
             Action::CloseOverlay => plain("CLOSE"),
             Action::OpenUrl { url } => Some(o(vec![("connectionType", e("URL")), ("connectionURL", s(url))])),
+            Action::UpdateMediaRuntime { .. } => {
+                self.warn("video prototype actions were left out; binary FIG media actions are not supported");
+                None
+            }
             Action::SetVariable { .. } | Action::SetVariableMode { .. } | Action::Conditional { .. } => {
                 self.warn("variable and conditional prototype actions were left out");
                 None

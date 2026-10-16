@@ -131,8 +131,18 @@ whether a click where nothing reacts flashes them (`hotspotHints`) and they are 
 (`inspected`) (`null` when nothing plays). `presentOptions` holds the options the next presentation
 starts with (`scale`, `deviceFrame`, `comments`, `hotspotHints`, `inspect`).
 The player's `video` object reports `desktopPlayback`, active source hashes (`sources`), `paused`,
-the shared clock in seconds (`time`), `duration` (null before decoding), `frameRevision` (changes
-when the supplied video frames change), and a visible playback `error` (null when none).
+the compatibility summary clock in seconds (`time`), `duration` (null before decoding),
+`frameRevision` (changes when decoded frame results are accepted), and a visible playback `error`
+(null when none). This revision counter is not a distinct-image FPS measurement.
+`frameTimes` maps each active source hash to the first active occurrence's last accepted frame
+time. Use `instances` for independent repeated-source playback: each entry reports `scope`,
+`node`, diagnostic `domain` and `patternPath`, `paintIndex`, `source`, `position`, `duration`,
+`playing`, `muted`, `looped`, `completedLoops`, `ready` (a frame is available), `frameTime` and
+`seekEpoch`. `playing` is that occurrence's intended state; global `paused` suspends playback
+without changing individually paused or playing states. The browser reports an empty instance list.
+On desktop, `audio` reports `playing`, `position`, `callbacks`, `nonzeroSamples`, `error`, and
+`sourceCount`. These counters show samples submitted through the native audio callback; they do
+not measure acoustic output or replace a loopback capture.
 `textPreview` is true while a live text preview shows on the canvas (a hovered text style or named
 instance, a dragged axis slider; see `text.preview` in [mcp.md](mcp.md)).
 `focus` is keyboard navigation's state: the `region` with the keyboard (`toolbar`, `layers`,

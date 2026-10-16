@@ -100,7 +100,7 @@ pub fn prepare(paint: &Paint, w: f64, h: f64, scale: f64, doc: &Document) -> Opt
 
 /// [`prepare`] `time` seconds into animated GIFs (0: their first frame).
 pub fn prepare_at(paint: &Paint, w: f64, h: f64, scale: f64, doc: &Document, time: f64) -> Option<Prepared> {
-    prepare_at_with_video_frames(paint, w, h, scale, doc, time, None)
+    prepare_at_with_video_frames(paint, w, h, scale, doc, time, None, None)
 }
 
 pub fn prepare_at_with_video_frames(
@@ -111,6 +111,7 @@ pub fn prepare_at_with_video_frames(
     doc: &Document,
     time: f64,
     video_frames: Option<&crate::draw::VideoFrames>,
+    video_context: Option<crate::video::VideoPaintContext>,
 ) -> Option<Prepared> {
     if !paint.visible || paint.opacity <= 0.0 {
         return None;
@@ -174,7 +175,7 @@ pub fn prepare_at_with_video_frames(
         }
         PaintKind::Video(video) => {
             let img = &video.poster;
-            let frame = video_frames.and_then(|frames| frames.get(&video.video));
+            let frame = video_context.and_then(|context| video_frames.and_then(|frames| frames.get(&context.instance())));
             let data = doc.images.get(&img.image);
             let pm = if let Some(frame) = frame {
                 if img.filters.is_identity() && doc.color_profile == figcraft_color::ColorProfile::Srgb {
@@ -203,7 +204,13 @@ pub fn prepare_at_with_video_frames(
             let transform = Transform::from_translate(-1.0, -1.0).post_concat(transform);
             Some(Prepared::Pattern { pixmap: padded, mode: SpreadMode::Pad, quality: FilterQuality::Bicubic, opacity: op, transform })
         }
-        PaintKind::Pattern(pt) => crate::pattern::prepare_with_video_frames(doc, pt, w, h, scale, time, op, video_frames),
+        PaintKind::Pattern(pt) => {
+            let pattern_context = match video_context {
+                Some(context) => Some(context.pattern_context()?),
+                None => None,
+            };
+            crate::pattern::prepare_with_video_frames(doc, pt, w, h, scale, time, op, video_frames, pattern_context)
+        }
     }
 }
 

@@ -39,7 +39,7 @@ pub fn nested<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
 /// the pixmap, the cell and the pixmap's pixels per unit on each axis (whole pixels per cell, so
 /// the repeat lines up exactly).
 pub fn cell_pixmap(doc: &Document, pt: &PatternPaint, w: f64, h: f64, scale: f64, time: f64) -> Option<(Pixmap, PatternCell, (f64, f64))> {
-    cell_pixmap_with_video_frames(doc, pt, w, h, scale, time, None)
+    cell_pixmap_with_video_frames(doc, pt, w, h, scale, time, None, None)
 }
 
 pub fn cell_pixmap_with_video_frames(
@@ -50,6 +50,7 @@ pub fn cell_pixmap_with_video_frames(
     scale: f64,
     time: f64,
     video_frames: Option<&crate::draw::VideoFrames>,
+    video_context: Option<crate::video::VideoRenderContext>,
 ) -> Option<(Pixmap, PatternCell, (f64, f64))> {
     let src = doc.node(NodeId(pt.source)).filter(|n| !n.is_page())?;
     let cell = pt.cell(src.width, src.height, w, h)?;
@@ -69,6 +70,7 @@ pub fn cell_pixmap_with_video_frames(
         under: None,
         time,
         video_frames,
+        video_context,
     };
     let unrotated = src.transform.inverse();
     nested(|| {
@@ -83,7 +85,7 @@ pub fn cell_pixmap_with_video_frames(
 
 /// The shader for pattern `pt` on a `w`×`h` box shown at `scale` device pixels per unit.
 pub fn prepare(doc: &Document, pt: &PatternPaint, w: f64, h: f64, scale: f64, time: f64, opacity: f32) -> Option<Prepared> {
-    prepare_with_video_frames(doc, pt, w, h, scale, time, opacity, None)
+    prepare_with_video_frames(doc, pt, w, h, scale, time, opacity, None, None)
 }
 
 pub fn prepare_with_video_frames(
@@ -95,8 +97,9 @@ pub fn prepare_with_video_frames(
     time: f64,
     opacity: f32,
     video_frames: Option<&crate::draw::VideoFrames>,
+    video_context: Option<crate::video::VideoRenderContext>,
 ) -> Option<Prepared> {
-    let (pix, cell, (kx, ky)) = cell_pixmap_with_video_frames(doc, pt, w, h, scale, time, video_frames)?;
+    let (pix, cell, (kx, ky)) = cell_pixmap_with_video_frames(doc, pt, w, h, scale, time, video_frames, video_context)?;
     let transform = Transform::from_row((1.0 / kx) as f32, 0.0, 0.0, (1.0 / ky) as f32, cell.origin.0 as f32, cell.origin.1 as f32);
     Some(Prepared::Pattern { pixmap: Arc::new(pix), mode: SpreadMode::Repeat, quality: FilterQuality::Bilinear, opacity, transform })
 }

@@ -1159,6 +1159,11 @@ fn remap_action(a: &mut proto::Action, map: &BTreeMap<NodeId, NodeId>) {
                 *dest = *m;
             }
         }
+        UpdateMediaRuntime { dest: Some(dest), .. } => {
+            if let Some(m) = map.get(dest) {
+                *dest = *m;
+            }
+        }
         _ => {}
     }
 }

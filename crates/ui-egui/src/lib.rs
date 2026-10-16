@@ -256,6 +256,57 @@ pub trait Services {
     fn gamepad_held(&mut self) -> u32 {
         0
     }
+    /// Start native prototype audio from already decoded, immutable PCM clips.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_audio(&mut self, _voices: Vec<AudioVoice>, _paused: bool) -> Result<Box<dyn PrototypeAudio>, String> {
+        Err("Audio playback is unavailable in this app".into())
+    }
+}
+
+/// Native prototype audio controls and output-clock telemetry.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait PrototypeAudio {
+    fn play(&mut self);
+    fn pause(&mut self);
+    fn restart(&mut self);
+    fn seek(&mut self, position_seconds: f64);
+    fn position_seconds(&self) -> f64;
+    fn inspect(&self) -> AudioInspect;
+    fn voice_state(&self, id: figcraft_render::VideoInstanceId) -> Option<AudioVoiceState>;
+    fn set_voice_state(&mut self, id: figcraft_render::VideoInstanceId, state: AudioVoiceState) -> Result<(), String>;
+}
+
+/// One video occurrence sharing the native prototype audio output.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug)]
+pub struct AudioVoice {
+    pub id: figcraft_render::VideoInstanceId,
+    pub clip: Option<std::sync::Arc<figcraft_media::AudioClip>>,
+    pub duration_seconds: f64,
+    pub state: AudioVoiceState,
+}
+
+/// Mutable playback state for one video occurrence.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AudioVoiceState {
+    pub position: f64,
+    pub playing: bool,
+    pub muted: bool,
+    pub looped: bool,
+    pub completed_loops: u64,
+}
+
+/// Output counters for `ui.inspect`; they do not prove physical audibility.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AudioInspect {
+    pub playing: bool,
+    pub position: f64,
+    pub callbacks: u64,
+    pub nonzero_samples: u64,
+    pub error: Option<String>,
+    pub source_count: usize,
 }
 
 pub type DialogFuture = Pin<Box<dyn Future<Output = Option<PathBuf>>>>;
@@ -1332,12 +1383,16 @@ impl FigApp {
         self.session.tool.redlines = self.ui.right_tab == RightTab::Inspect;
         self.end_pen_outside_design();
         if self.ui.present.is_some() {
+            #[cfg(not(target_arch = "wasm32"))]
+            present::suspend_preview(self, ctx.input(|i| i.time));
             present::show(self, ui);
             // What went wrong while presenting (a widget's plugin failing) shows over it.
             self.toast_ui(&ctx);
             return;
         }
         if !self.has_files() || self.ui.home {
+            #[cfg(not(target_arch = "wasm32"))]
+            present::suspend_preview(self, ctx.input(|i| i.time));
             tabs::tab_bar(self, ui);
             home::show(self, ui);
             dialogs::keys(self, &ctx);
