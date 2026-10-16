@@ -6,6 +6,7 @@ use serde_json::json;
 
 use crate::FigApp;
 use crate::i18n::{self, tr, tr_noop, trf};
+use crate::icons::{self, Icon};
 use crate::theme::{Tokens, semibold};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -54,9 +55,7 @@ pub(crate) fn show(app: &mut FigApp, ctx: &egui::Context) {
         header.label(RichText::new(tr("Preferences")).font(semibold(18.0)).color(t.text));
         header.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(12.0);
-            let close = ui.add_sized(vec2(28.0, 28.0), egui::Button::new(RichText::new("×").size(18.0))).on_hover_text(tr("Close"));
-            close.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr("Close")));
-            if close.clicked() {
+            if icons::button(ui, Icon::Close, 28.0, false, tr("Close")).clicked() {
                 open = false;
             }
         });
